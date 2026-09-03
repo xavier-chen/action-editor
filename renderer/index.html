@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; font-src 'self'; connect-src 'none'; media-src 'none'; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'none'">
+  <title>Action Editor</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="config-tools" aria-label="配置文件工具">
+        <button id="exportConfigButton" class="button secondary config-button" type="button">导出配置</button>
+        <button id="importConfigButton" class="button secondary config-button" type="button">导入配置</button>
+        <span id="saveStatus" class="save-status saved"><i></i><span>ID 自动保存</span></span>
+      </div>
+
+      <form id="connectionForm" class="connection-form">
+        <label>接口<input id="interfaceInput" value="can0" maxlength="15" autocomplete="off"></label>
+        <label class="simulate-label"><input id="simulateInput" type="checkbox"><span>仿真</span></label>
+        <button id="connectButton" class="button primary" type="submit">连接 CAN</button>
+        <button id="disconnectButton" class="button secondary" type="button" disabled>断开</button>
+      </form>
+
+      <div id="connectionBadge" class="connection-badge offline"><i></i><span>未连接</span></div>
+      <button id="emergencyButton" class="emergency" type="button" disabled><b>■ 全总线急停</b><small>立即 STOP + DISABLE</small></button>
+    </header>
+
+    <nav class="page-tabs" role="tablist" aria-label="工作页面">
+      <button id="motorControlTab" class="page-tab active" type="button" role="tab" aria-selected="true" aria-controls="motorControlPage" tabindex="0">电机控制</button>
+      <button id="timelineEditorTab" class="page-tab" type="button" role="tab" aria-selected="false" aria-controls="timelineEditorPage" tabindex="-1">电机控制时间轴</button>
+      <button id="namedActionEditorTab" class="page-tab" type="button" role="tab" aria-selected="false" aria-controls="namedActionEditorPage" tabindex="-1">动作编辑</button>
+      <button id="actionTimelineTab" class="page-tab" type="button" role="tab" aria-selected="false" aria-controls="actionTimelinePage" tabindex="-1">动作时间轴</button>
+    </nav>
+
+    <div class="page-host">
+    <main id="motorControlPage" class="app-page terminal-layout" role="tabpanel" aria-labelledby="motorControlTab">
+      <section class="panel motors-panel">
+        <div class="panel-heading motors-heading">
+          <div>
+            <h2>全部电机控制</h2>
+            <p><span id="configuredCount">0</span> / <span id="motorCount">0</span> 已配置 ID · ID 可重复</p>
+          </div>
+          <div class="motors-heading-actions">
+            <div class="motor-catalog-actions" role="group" aria-label="电机与分组管理">
+              <button id="addGroupButton" class="button secondary compact" type="button" title="添加一个可重命名的电机分组">＋ 添加分组</button>
+              <button id="addMotorButton" class="button secondary compact" type="button" title="添加时设置名称和分组；创建后不可修改">＋ 添加电机</button>
+            </div>
+            <div class="field-help"><span>名称</span><span>创建后固定</span><span>ID</span><span>可重复</span><span>参数 / 模式</span><span>步数 · 速 · 加 · 开/闭环</span></div>
+          </div>
+        </div>
+
+        <div id="motorRows" class="motor-board" aria-label="电机控制列表"></div>
+
+        <div class="origin-bar">
+          <div>
+            <p class="eyebrow">RETURN TO ORIGIN</p>
+            <h3>返回本次连接的起点</h3>
+            <p id="originSummary">尚未连接 CAN</p>
+          </div>
+          <div class="origin-actions">
+            <button id="setOriginButton" class="button secondary" type="button" disabled>当前位置设为起点</button>
+            <button id="returnOriginButton" class="button primary" type="button" disabled>全部返回起点</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="panel records-panel">
+        <div class="panel-heading records-heading">
+          <div><h2>指令记录</h2><p>共 <span id="programCount">0</span> 条，可按顺序批量重发</p></div>
+          <button id="clearProgramButton" class="text-button" type="button" disabled>清空</button>
+        </div>
+
+        <div class="batch-actions">
+          <button id="sendAllButton" class="button primary wide" type="button" disabled>按顺序发送全部记录</button>
+          <p>使用记录时保存的 ID、步数、速度、加速度和开/闭环模式；不会重复添加记录。</p>
+        </div>
+
+        <div id="programList" class="program-list"><p class="empty">还没有指令记录</p></div>
+
+        <div class="log-heading"><h3>发送日志</h3><button id="clearLogButton" class="text-button" type="button">清空日志</button></div>
+        <div id="sendLog" class="send-log"><p class="empty">等待发送 CAN 指令…</p></div>
+      </section>
+    </main>
+
+    <main id="timelineEditorPage" class="app-page timeline-page" role="tabpanel" aria-labelledby="timelineEditorTab" hidden>
+      <aside class="panel timeline-editor-panel">
+        <div class="timeline-editor-heading">
+          <div>
+            <h2>电机动作编辑器</h2>
+            <p id="timelineEditorMode">新建动作 · 拖动时间尺获取开始时间</p>
+          </div>
+        </div>
+
+        <div class="timeline-project-actions" role="group" aria-label="动画时间轴文件操作">
+          <button id="timelineSaveProjectButton" class="button secondary compact" type="button">保存时间轴</button>
+          <button id="timelineImportProjectButton" class="button secondary compact" type="button">导入动画</button>
+          <button id="timelineExportProjectButton" class="button secondary compact" type="button">导出动画</button>
+        </div>
+
+        <form id="timelineActionForm" class="timeline-action-form">
+          <section id="timelineSelectedMotor" class="timeline-selected-motor" aria-live="polite">
+            <span>当前控制位置</span>
+            <strong id="timelineSelectedMotorName">—</strong>
+            <small id="timelineSelectedMotorMeta">点击右侧电机行进行选择</small>
+          </section>
+          <p id="timelineBindingHint" class="timeline-binding-hint">请选择已配置 ID 的位置</p>
+
+          <fieldset id="timelineDirectionButtons" class="timeline-direction-field">
+            <legend>运动方向</legend>
+            <button class="timeline-direction-button active" type="button" data-direction="1" aria-pressed="true">＋ 正向</button>
+            <button class="timeline-direction-button" type="button" data-direction="-1" aria-pressed="false">－ 反向</button>
+          </fieldset>
+
+          <div class="timeline-action-fields">
+            <label title="拖动右侧时间尺或黄色播放头可实时填写">开始时间 / ms
+              <input id="timelineStartInput" type="number" min="0" max="600000" step="100" value="0">
+            </label>
+            <label>相对步数
+              <input id="timelineStepsInput" type="number" min="1" max="16777215" step="1" value="1000">
+            </label>
+            <label>速度等级
+              <input id="timelineSpeedInput" type="number" min="1" max="100" step="1" value="20">
+            </label>
+            <label>加速度等级
+              <input id="timelineAccelerationInput" type="number" min="1" max="100" step="1" value="20">
+            </label>
+            <label class="timeline-loop-mode-field">控制模式
+              <select id="timelineLoopModeSelect">
+                <option value="open" selected>开环</option>
+                <option value="closed">闭环</option>
+              </select>
+            </label>
+          </div>
+
+          <section id="timelineEstimateCard" class="timeline-estimate-card" aria-live="polite">
+            <div class="timeline-estimate-main">
+              <span>理论动作持续</span>
+              <strong id="timelineEstimatedDuration">—</strong>
+            </div>
+            <p id="timelineEstimatedWindow">输入完整参数后显示预计结束时间</p>
+            <p id="timelineEstimateProfile">离线时按固件默认运动参数估算</p>
+            <button id="timelinePlaceAfterButton" class="text-button timeline-place-after" type="button" disabled>接到同 ID 最后</button>
+          </section>
+
+          <div class="timeline-protocol-note">
+            <b>时间点 = 指令发送时间</b>
+            <span>动作块长度 = 理论轨迹时间；闭环到位与模式切换可能更久。同刻不同 ID 近似同时下发，实际起转仍由 CAN 与电机 FIFO 决定。</span>
+          </div>
+
+          <div class="timeline-test-actions">
+            <button id="timelineTestButton" class="button secondary" type="button" disabled>测试动作</button>
+            <button id="timelineStopTestButton" class="button warning" type="button" disabled>■ 停止测试</button>
+          </div>
+          <button id="timelineSaveActionButton" class="button primary wide" type="submit">＋ 添加为新动作</button>
+          <button id="timelineUpdateActionButton" class="button secondary wide" type="button" hidden>更新所选动作</button>
+          <button id="timelineDeleteActionButton" class="text-button timeline-delete-action" type="button" hidden>删除所选动作</button>
+        </form>
+      </aside>
+
+      <section class="panel timeline-panel">
+        <header class="timeline-toolbar">
+          <div class="timeline-transport">
+            <button id="timelinePlayButton" class="button primary" type="button" disabled>▶ 从头播放</button>
+            <button id="timelineStopButton" class="button warning" type="button" disabled>■ 停止</button>
+          </div>
+          <output id="timelineTimeDisplay" class="timeline-time-display">00:00.000 / 00:10.000</output>
+          <div class="timeline-tools">
+            <label>时长 / 秒<input id="timelineDurationInput" type="number" min="1" max="600" step="1" value="10"></label>
+            <label>吸附<select id="timelineSnapSelect"><option value="0">关闭</option><option value="50">50 ms</option><option value="100" selected>100 ms</option><option value="250">250 ms</option><option value="500">500 ms</option><option value="1000">1 s</option></select></label>
+            <label>缩放<input id="timelineZoomInput" type="range" min="50" max="240" step="10" value="120" aria-label="时间轨缩放"></label>
+            <button id="timelineClearButton" class="text-button" type="button" disabled>清空</button>
+          </div>
+        </header>
+
+        <div class="timeline-statusbar">
+          <span><b id="timelineEnabledTrackCount">0</b> 个位置使能 · <b id="timelineActionCount">0</b> 个动作</span>
+          <span id="timelineStatus">拖动时间尺或黄色指针获取开始时间；动作块可调整时间或轨道</span>
+        </div>
+
+        <div id="timelineScroller" class="timeline-scroll" tabindex="0" aria-label="动作时间轨编辑区域">
+          <div id="timelineCanvas" class="timeline-canvas">
+            <div class="timeline-corner">点击行选择 / 使能 / ID</div>
+            <div id="timelineRuler" class="timeline-ruler" tabindex="0" role="slider" aria-label="拖动时间标尺设置开始时间；方向键微调" aria-valuemin="0" aria-valuemax="10000" aria-valuenow="0" aria-valuetext="0 ms"></div>
+            <div id="timelineTracks" class="timeline-tracks"></div>
+            <div id="timelinePlayhead" class="timeline-playhead" data-time="0 ms" aria-hidden="true"><span id="timelinePlayheadHandle" class="timeline-playhead-handle"></span></div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <main id="namedActionEditorPage" class="app-page named-action-page" role="tabpanel" aria-labelledby="namedActionEditorTab" hidden>
+      <aside class="panel named-action-library-panel">
+        <header class="named-panel-heading">
+          <div>
+            <p class="eyebrow">ACTION LIBRARY</p>
+            <h2>动作库</h2>
+            <p>一个动作可包含一个或多个电机运动</p>
+          </div>
+          <button id="namedActionNewButton" class="button secondary compact" type="button">＋ 新动作</button>
+        </header>
+
+        <div class="named-action-definition-form">
+          <label>动作名称
+            <input id="namedActionNameInput" type="text" maxlength="32" autocomplete="off" spellcheck="false" placeholder="例如：眨眼、微笑、点头">
+          </label>
+          <p id="namedActionDraftStatus">新动作尚未保存</p>
+          <button id="namedActionSaveButton" class="button primary wide" type="button">保存为命名动作</button>
+          <button id="namedActionDeleteButton" class="text-button" type="button" disabled>删除当前动作</button>
+        </div>
+
+        <div class="named-action-list-heading">
+          <span>已保存动作</span>
+          <b id="namedActionDefinitionCount">0</b>
+        </div>
+        <div id="namedActionDefinitionList" class="named-action-definition-list">
+          <p class="empty">还没有命名动作</p>
+        </div>
+      </aside>
+
+      <section class="panel named-motion-editor-panel">
+        <header class="named-panel-heading">
+          <div>
+            <p class="eyebrow">MOTOR MOTION</p>
+            <h2>添加电机运动</h2>
+            <p>开始时间是相对于本动作开始的时间</p>
+          </div>
+        </header>
+
+        <form id="namedMotionForm" class="named-motion-form">
+          <label>电机位置
+            <select id="namedMotionMotorSelect"></select>
+          </label>
+          <p id="namedMotionBindingHint" class="named-motion-binding-hint">请选择已配置 ID 的电机</p>
+
+          <fieldset id="namedMotionDirectionButtons" class="timeline-direction-field named-motion-direction-field">
+            <legend>运动方向</legend>
+            <button class="named-motion-direction-button active" type="button" data-direction="1" aria-pressed="true">＋ 正向</button>
+            <button class="named-motion-direction-button" type="button" data-direction="-1" aria-pressed="false">－ 反向</button>
+          </fieldset>
+
+          <div class="named-motion-fields">
+            <label>相对开始 / ms
+              <input id="namedMotionStartInput" type="number" min="0" max="600000" step="100" value="0">
+            </label>
+            <label>相对步数
+              <input id="namedMotionStepsInput" type="number" min="1" max="16777215" step="1" value="1000">
+            </label>
+            <label>速度等级
+              <input id="namedMotionSpeedInput" type="number" min="1" max="100" step="1" value="20">
+            </label>
+            <label>加速度等级
+              <input id="namedMotionAccelerationInput" type="number" min="1" max="100" step="1" value="20">
+            </label>
+            <label>控制模式
+              <select id="namedMotionLoopModeSelect">
+                <option value="open" selected>开环</option>
+                <option value="closed">闭环</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="named-motion-actions">
+            <button id="namedMotionTestButton" class="button secondary" type="button" disabled>测试当前运动</button>
+            <button id="namedMotionAddButton" class="button primary" type="submit">＋ 添加到动作</button>
+          </div>
+          <button id="namedMotionUpdateButton" class="button secondary wide" type="button" hidden>更新所选运动</button>
+          <button id="namedMotionCancelEditButton" class="text-button" type="button" hidden>取消编辑</button>
+        </form>
+      </section>
+
+      <section class="panel named-motion-list-panel">
+        <header class="named-panel-heading named-motion-list-heading">
+          <div>
+            <p class="eyebrow">ACTION CONTENT</p>
+            <h2 id="namedActionContentTitle">未命名动作</h2>
+            <p><span id="namedMotionCount">0</span> 个电机运动 · 理论时长 <span id="namedActionEstimatedDuration">—</span></p>
+          </div>
+          <div class="named-action-test-actions">
+            <button id="namedActionTestButton" class="button primary" type="button" disabled>▶ 测试整个动作</button>
+            <button id="namedActionStopButton" class="button warning" type="button" disabled>■ 停止</button>
+          </div>
+        </header>
+        <div class="named-motion-column-headings" aria-hidden="true">
+          <span>时间</span><span>电机</span><span>运动参数</span><span>操作</span>
+        </div>
+        <div id="namedMotionList" class="named-motion-list">
+          <p class="empty">请从左侧命名，再添加电机运动</p>
+        </div>
+        <footer id="namedActionEditorStatus" class="named-action-editor-status">尚未保存的修改不会进入动作时间轴；点击保存后可重复使用</footer>
+      </section>
+    </main>
+
+    <main id="actionTimelinePage" class="app-page action-sequence-page" role="tabpanel" aria-labelledby="actionTimelineTab" hidden>
+      <section class="panel action-sequence-panel">
+        <header class="action-sequence-toolbar">
+          <div class="action-sequence-transport">
+            <button id="actionTimelinePlayButton" class="button primary" type="button" disabled>▶ 从头播放</button>
+            <button id="actionTimelineStopButton" class="button warning" type="button" disabled>■ 停止</button>
+          </div>
+          <output id="actionTimelineTimeDisplay" class="timeline-time-display">00:00.000 / 00:10.000</output>
+          <div class="action-sequence-project-actions" role="group" aria-label="动作时间轴文件操作">
+            <button id="actionTimelineSaveProjectButton" class="button secondary compact" type="button">保存时间轴</button>
+            <button id="actionTimelineImportProjectButton" class="button secondary compact" type="button">导入动画</button>
+            <button id="actionTimelineExportProjectButton" class="button secondary compact" type="button">导出动画</button>
+          </div>
+          <button id="actionTimelineAddTrackButton" class="button secondary action-add-track-button" type="button">＋ 添加轨道</button>
+          <div class="action-sequence-tools">
+            <label>时长 / 秒<input id="actionTimelineDurationInput" type="number" min="1" max="600" step="1" value="10"></label>
+            <label>吸附<select id="actionTimelineSnapSelect"><option value="0">关闭</option><option value="50">50 ms</option><option value="100" selected>100 ms</option><option value="250">250 ms</option><option value="500">500 ms</option><option value="1000">1 s</option></select></label>
+            <label>缩放<input id="actionTimelineZoomInput" type="range" min="50" max="240" step="10" value="120" aria-label="动作时间轴缩放"></label>
+            <button id="actionTimelineDeleteButton" class="text-button" type="button" disabled>删除所选</button>
+            <button id="actionTimelineClearButton" class="text-button" type="button" disabled>清空</button>
+          </div>
+        </header>
+
+        <div class="action-sequence-workspace">
+          <aside class="action-palette" aria-labelledby="actionPaletteTitle">
+            <header class="action-palette-heading">
+              <div>
+                <p class="eyebrow">ACTION LIBRARY</p>
+                <h2 id="actionPaletteTitle">动作素材</h2>
+              </div>
+              <b id="actionTimelineDefinitionCount">0</b>
+            </header>
+            <p class="action-palette-help">单击选择，双击立即添加；也可拖到右侧时间轴的指定位置。</p>
+            <label class="action-palette-search">搜索动作
+              <input id="actionTimelineSearchInput" type="search" maxlength="64" autocomplete="off" placeholder="输入动作名称">
+            </label>
+            <div id="actionTimelineDefinitionPalette" class="action-palette-list" role="list" aria-label="可添加的命名动作"></div>
+            <footer class="action-palette-footer">
+              <div id="actionTimelineSelectedDefinition" class="action-palette-selected">尚未选择动作</div>
+              <button id="actionTimelineAddButton" class="button primary" type="button" disabled>＋ 添加到当前光标</button>
+            </footer>
+          </aside>
+
+          <section class="action-timeline-stage" aria-label="动作时间轴">
+            <div class="action-sequence-statusbar">
+              <span><b id="actionTimelineTrackCount">1</b> 条轨道 · <b id="actionTimelinePlacementCount">0</b> 个动作实例</span>
+              <span id="actionTimelineStatus">先在“动作编辑”中保存动作，再拖入时间轴</span>
+            </div>
+
+            <div id="actionTimelineScroller" class="action-sequence-scroll" tabindex="0" aria-label="命名动作时间轴编辑区域；可将左侧动作拖入这里">
+              <div id="actionTimelineCanvas" class="action-sequence-canvas">
+                <div class="action-sequence-corner">动作轨道</div>
+                <div id="actionTimelineRuler" class="action-sequence-ruler" tabindex="0" role="slider" aria-label="拖动时间标尺设置动作开始时间；方向键微调" aria-valuemin="0" aria-valuemax="10000" aria-valuenow="0" aria-valuetext="0 ms"></div>
+                <div id="actionTimelineTracks" class="action-sequence-tracks"></div>
+                <div id="actionTimelinePlayhead" class="action-sequence-playhead" data-time="0 ms" aria-hidden="true"><span id="actionTimelinePlayheadHandle" class="action-sequence-playhead-handle"></span></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+    </main>
+
+    </div>
+
+    <div id="toastRegion" class="toast-region" aria-live="polite"></div>
+
+    <div id="confirmModal" class="modal-backdrop" hidden>
+      <div class="modal confirm-modal" role="dialog" aria-modal="true" aria-labelledby="confirmTitle">
+        <div class="confirm-icon">!</div>
+        <h2 id="confirmTitle">确认操作</h2>
+        <p id="confirmMessage"></p>
+        <div class="modal-actions">
+          <button id="confirmCancelButton" class="button secondary" type="button">取消</button>
+          <button id="confirmAcceptButton" class="button warning" type="button">确认</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="motorCreateModal" class="modal-backdrop" hidden>
+      <form id="motorCreateForm" class="modal motor-create-modal" role="dialog" aria-modal="true" aria-labelledby="motorCreateTitle">
+        <h2 id="motorCreateTitle">添加电机</h2>
+        <p>请在创建时确定电机名称和所属分组。创建后两者均不可修改；如需调整，请删除后重新添加。</p>
+        <label>电机名称
+          <input id="motorCreateNameInput" type="text" maxlength="32" autocomplete="off" spellcheck="false" required>
+        </label>
+        <label>所属分组
+          <select id="motorCreateGroupSelect" required></select>
+        </label>
+        <p id="motorCreateError" class="modal-form-error" role="alert" aria-live="polite"></p>
+        <div class="modal-actions">
+          <button id="motorCreateCancelButton" class="button secondary" type="button">取消</button>
+          <button id="motorCreateAcceptButton" class="button primary" type="submit">添加电机</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <script src="../src/motor-registry.js"></script>
+  <script src="../src/command-ledger.js"></script>
+  <script src="../src/timeline-model.js"></script>
+  <script src="../src/action-library.js"></script>
+  <script src="named-actions.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

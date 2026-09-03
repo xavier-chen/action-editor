@@ -1,0 +1,38 @@
+{
+  "name": "action-editor",
+  "productName": "Action Editor",
+  "version": "1.0.0",
+  "private": true,
+  "description": "鹏睿机器人（深圳）有限公司的人面机器人表情电机 Protocol 6 CAN 控制与动作时间轴软件",
+  "author": "鹏睿机器人（深圳）有限公司",
+  "license": "Apache-2.0",
+  "main": "main.js",
+  "type": "commonjs",
+  "keywords": [
+    "electron",
+    "socketcan",
+    "can-bus",
+    "robotics",
+    "stepper-motor",
+    "facial-robot"
+  ],
+  "engines": {
+    "node": ">=24.20.0"
+  },
+  "packageManager": "npm@11.19.0",
+  "allowScripts": {
+    "electron@41.10.7": true
+  },
+  "scripts": {
+    "start": "electron .",
+    "start:desktop": "./scripts/run.sh",
+    "check": "node --check main.js && node --check preload.js && node --check renderer/app.js && node --check renderer/named-actions.js && node --check src/motor-registry.js && node --check src/command-ledger.js && node --check src/timeline-model.js && node --check src/action-library.js && node --check src/bridge-client.js && python3 -c \"from pathlib import Path; path = Path('bridge/lumdriver_bridge.py'); compile(path.read_bytes(), str(path), 'exec')\" && bash -n scripts/run.sh && bash -n scripts/install-desktop.sh",
+    "test": "node --test tests/*.test.js",
+    "test:bridge": "python3 -B -m unittest tests/test_bridge_transport.py",
+    "verify": "npm run check && npm test && npm run test:bridge",
+    "desktop:install": "./scripts/install-desktop.sh"
+  },
+  "devDependencies": {
+    "electron": "41.10.7"
+  }
+}

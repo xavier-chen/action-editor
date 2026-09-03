@@ -1,0 +1,56 @@
+name: Bug 报告
+description: 报告 Action Editor 的可复现问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: checkboxes
+    attributes:
+      label: 安全确认
+      options:
+        - label: 我已断开或安全隔离真实电机，并确认报告中不含危险的公开复现步骤。
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Action Editor 版本或提交
+      placeholder: 例如 v1.0.0 或提交哈希
+    validations:
+      required: true
+  - type: input
+    id: platform
+    attributes:
+      label: 系统与架构
+      placeholder: 例如 Ubuntu 24.04 arm64 / Orange Pi
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: 运行模式
+      options:
+        - 仿真模式
+        - 真实 SocketCAN
+        - 尚未连接
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 复现步骤
+      description: 优先提供不会驱动真实硬件的最小步骤。
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期结果
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际结果与日志
+      description: 请删除路径、设备标识和其他敏感信息。
+    validations:
+      required: true

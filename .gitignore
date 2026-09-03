@@ -1,0 +1,40 @@
+# Node / Electron
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Build and release output
+dist/
+out/
+release/
+coverage/
+.runtime/
+*.AppImage
+*.deb
+*.rpm
+*.blockmap
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local configuration and editor files
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.log
+
+# User-exported hardware configuration and timelines
+Action Editor-电机配置-*.json
+Action Editor-动画时间轴-*.json
+Action Editor-动作时间轴-*.json
+# Legacy export names from releases branded as LumMotor
+LumMotor-电机配置-*.json
+LumMotor-动画时间轴-*.json
+LumMotor-动作时间轴-*.json
