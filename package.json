@@ -33,6 +33,6 @@
     "desktop:install": "./scripts/install-desktop.sh"
   },
   "devDependencies": {
-    "electron": "41.10.7"
+    "electron": "44.0.0"
   }
 }
