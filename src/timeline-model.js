@@ -246,6 +246,27 @@
     return distance * 1_000 / scale;
   }
 
+  function shiftTimelineStartMs(
+    originalStartMs,
+    pointerDeltaPixels,
+    scrollDeltaPixels,
+    pixelsPerSecond,
+    snapMs = 100,
+    maximum = MAX_START_MS,
+  ) {
+    const original = integer(originalStartMs, "原开始时间", 0, MAX_START_MS);
+    const pointerDelta = Number(pointerDeltaPixels);
+    const scrollDelta = Number(scrollDeltaPixels);
+    if (!Number.isFinite(pointerDelta) || !Number.isFinite(scrollDelta)) {
+      throw new TypeError("拖拽位移必须是数字");
+    }
+    const shifted = original + millisecondsFromPixels(
+      pointerDelta + scrollDelta,
+      pixelsPerSecond,
+    );
+    return snapStartMs(shifted, snapMs, maximum);
+  }
+
   function freezeArray(items) {
     return Object.freeze(items.slice());
   }
@@ -382,6 +403,7 @@
     validateAction,
     snapStartMs,
     millisecondsFromPixels,
+    shiftTimelineStartMs,
     TimelineProgram,
   });
 }));

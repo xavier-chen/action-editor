@@ -282,11 +282,30 @@
             <button id="namedActionStopButton" class="button warning" type="button" disabled>■ 停止</button>
           </div>
         </header>
-        <div class="named-motion-column-headings" aria-hidden="true">
-          <span>时间</span><span>电机</span><span>运动参数</span><span>操作</span>
+        <div class="named-motion-timeline-toolbar">
+          <div>
+            <b>动作内部时间轴</b>
+            <span>同一电机的运动自动归入同一行；单击编辑，左右拖动调整开始时间</span>
+          </div>
+          <label>吸附
+            <select id="namedMotionSnapSelect">
+              <option value="0">关闭</option>
+              <option value="50">50 ms</option>
+              <option value="100" selected>100 ms</option>
+              <option value="250">250 ms</option>
+              <option value="500">500 ms</option>
+              <option value="1000">1 s</option>
+            </select>
+          </label>
+          <output id="namedMotionCursorDisplay">00:00.000</output>
         </div>
-        <div id="namedMotionList" class="named-motion-list">
-          <p class="empty">请从左侧命名，再添加电机运动</p>
+        <div id="namedMotionTimelineScroller" class="named-motion-timeline-scroll" tabindex="0" aria-label="当前动作的电机时间轴；同一电机的运动在同一行">
+          <div id="namedMotionTimelineCanvas" class="named-motion-timeline-canvas">
+            <div class="named-motion-timeline-corner">电机轨道</div>
+            <div id="namedMotionTimelineRuler" class="named-motion-timeline-ruler" tabindex="0" role="slider" aria-label="拖动时间标尺设置新增运动的相对开始时间；方向键微调" aria-valuemin="0" aria-valuemax="7000" aria-valuenow="0" aria-valuetext="0 ms"></div>
+            <div id="namedMotionList" class="named-motion-timeline-tracks"></div>
+            <div id="namedMotionTimelinePlayhead" class="named-motion-timeline-playhead" data-time="0 ms" aria-hidden="true"><span id="namedMotionTimelinePlayheadHandle" class="named-motion-timeline-playhead-handle"></span></div>
+          </div>
         </div>
         <footer id="namedActionEditorStatus" class="named-action-editor-status">尚未保存的修改不会进入动作时间轴；点击保存后可重复使用</footer>
       </section>

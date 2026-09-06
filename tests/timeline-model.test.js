@@ -18,6 +18,7 @@ const {
   motionRatesFromLevels,
   normalizeMotionProfile,
   snapStartMs,
+  shiftTimelineStartMs,
   validateAction,
 } = require("../src/timeline-model");
 
@@ -158,6 +159,11 @@ test("snap and drag conversion use bounded absolute milliseconds", () => {
   assert.equal(snapStartMs(149.4, 0, 1000), 149);
   assert.equal(millisecondsFromPixels(120, 120), 1000);
   assert.equal(millisecondsFromPixels(-30, 60), -500);
+  assert.equal(shiftTimelineStartMs(1_200, 100, 10, 110, 100, 10_000), 2_200);
+  assert.equal(shiftTimelineStartMs(1_200, -220, 0, 110, 100, 10_000), 0);
+  assert.equal(shiftTimelineStartMs(9_900, 22, 0, 110, 100, 10_000), 10_000);
+  assert.equal(shiftTimelineStartMs(1_200, 5.5, 0, 110, 0, 10_000), 1_250);
+  assert.throws(() => shiftTimelineStartMs(1_200, Number.NaN, 0, 110), /拖拽位移/);
 });
 
 test("duration estimate follows the firmware quadratic level mapping and S-curve", () => {
@@ -235,5 +241,6 @@ test("UMD build exposes the timeline model to a browser global", () => {
   });
   vm.runInContext(source, context, { filename });
   assert.equal(typeof context.FaceTimelineModel.TimelineProgram, "function");
+  assert.equal(typeof context.FaceTimelineModel.shiftTimelineStartMs, "function");
   assert.ok(Object.isFrozen(context.FaceTimelineModel));
 });

@@ -147,6 +147,47 @@
     });
   }
 
+  function deriveMotionLanes(motions, motorOrder = []) {
+    if (!Array.isArray(motions)) throw new TypeError("动作运动片段必须是数组");
+    if (!Array.isArray(motorOrder)) throw new TypeError("电机顺序必须是数组");
+
+    const orderByMotorId = new Map();
+    for (const motorId of motorOrder) {
+      const normalizedMotorId = registry.normalizeMotorId(motorId);
+      if (!orderByMotorId.has(normalizedMotorId)) {
+        orderByMotorId.set(normalizedMotorId, orderByMotorId.size);
+      }
+    }
+
+    const laneByMotorId = new Map();
+    motions.forEach((motionInput, index) => {
+      const motion = validateMotion(motionInput);
+      let lane = laneByMotorId.get(motion.motorId);
+      if (!lane) {
+        lane = { motorId: motion.motorId, firstIndex: index, entries: [] };
+        laneByMotorId.set(motion.motorId, lane);
+      }
+      lane.entries.push(Object.freeze({ motion, index }));
+    });
+
+    return freezeArray([...laneByMotorId.values()]
+      .sort((left, right) => {
+        const leftOrder = orderByMotorId.has(left.motorId)
+          ? orderByMotorId.get(left.motorId)
+          : Number.MAX_SAFE_INTEGER;
+        const rightOrder = orderByMotorId.has(right.motorId)
+          ? orderByMotorId.get(right.motorId)
+          : Number.MAX_SAFE_INTEGER;
+        return leftOrder - rightOrder || left.firstIndex - right.firstIndex;
+      })
+      .map((lane) => Object.freeze({
+        motorId: lane.motorId,
+        entries: freezeArray(lane.entries.slice().sort((left, right) => (
+          left.motion.startMs - right.motion.startMs || left.index - right.index
+        ))),
+      })));
+  }
+
   function validatePlacement(input) {
     const record = plainRecord(input, "动作时间轴放置项");
     onlyKeys(
@@ -660,6 +701,7 @@
     MAX_STEP_COUNT,
     validateMotion,
     validateActionDefinition,
+    deriveMotionLanes,
     validatePlacement,
     validateActionTrack,
     ActionLibrary,

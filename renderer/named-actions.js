@@ -11,6 +11,13 @@
   const DEFAULT_DURATION_MS = 10_000;
   const DEFAULT_SNAP_MS = 100;
   const DEFAULT_PIXELS_PER_SECOND = 120;
+  const DEFAULT_NAMED_MOTION_SNAP_MS = 100;
+  const NAMED_MOTION_PIXELS_PER_SECOND = 110;
+  const MIN_NAMED_MOTION_DURATION_MS = 7_000;
+  const MIN_NAMED_MOTION_CLIP_WIDTH_PX = 72;
+  const NAMED_MOTION_CLIP_HEIGHT_PX = 38;
+  const NAMED_MOTION_CLIP_LAYER_STEP_PX = 42;
+  const NAMED_MOTION_CLIP_GAP_PX = 4;
   const MAX_EXPANDED_MOTIONS = 4_096;
   const SNAP_OPTIONS = new Set([0, 50, 100, 250, 500, 1_000]);
   const byId = (id) => document.getElementById(id);
@@ -27,6 +34,10 @@
   let draftMotions = [];
   let selectedDraftMotionIndex = null;
   let motionDirection = 1;
+  let namedMotionCursorMs = 0;
+  let namedMotionSnapMs = DEFAULT_NAMED_MOTION_SNAP_MS;
+  let namedMotionCursorDrag = null;
+  let namedMotionClipDrag = null;
   let durationMs = DEFAULT_DURATION_MS;
   let snapMs = DEFAULT_SNAP_MS;
   let pixelsPerSecond = DEFAULT_PIXELS_PER_SECOND;
@@ -71,6 +82,32 @@
     return timelineActionEstimate(normalizedMotionForEstimate(motion));
   }
 
+  function motionSchedule(motions) {
+    const availableByNode = new Map();
+    return motions
+      .map((motion, index) => ({ motion, index }))
+      .sort((left, right) => (
+        left.motion.startMs - right.motion.startMs || left.index - right.index
+      ))
+      .map(({ motion, index }) => {
+        const estimate = motionEstimate(motion);
+        const estimatedStartMs = Math.max(
+          motion.startMs,
+          availableByNode.get(motion.nodeId) || 0,
+        );
+        const estimatedEndMs = estimatedStartMs + estimate.durationMs;
+        availableByNode.set(motion.nodeId, estimatedEndMs);
+        return Object.freeze({
+          motion,
+          index,
+          estimate,
+          estimatedStartMs,
+          estimatedEndMs,
+          queuedDelayMs: estimatedStartMs - motion.startMs,
+        });
+      });
+  }
+
   function definitionDuration(definitionOrMotions) {
     const cacheableDefinition = !Array.isArray(definitionOrMotions)
       && definitionOrMotions
@@ -83,24 +120,73 @@
     const motions = Array.isArray(definitionOrMotions)
       ? definitionOrMotions
       : cacheableDefinition?.motions || [];
-    const availableByNode = new Map();
-    let latestEndMs = 0;
-    motions
-      .map((motion, insertionIndex) => ({ motion, insertionIndex }))
-      .sort((left, right) => (
-        left.motion.startMs - right.motion.startMs || left.insertionIndex - right.insertionIndex
-      ))
-      .forEach(({ motion }) => {
-        const estimatedStartMs = Math.max(
-          motion.startMs,
-          availableByNode.get(motion.nodeId) || 0,
-        );
-        const estimatedEndMs = estimatedStartMs + motionEstimate(motion).durationMs;
-        availableByNode.set(motion.nodeId, estimatedEndMs);
-        latestEndMs = Math.max(latestEndMs, estimatedEndMs);
-      });
+    const latestEndMs = motionSchedule(motions).reduce(
+      (latest, entry) => Math.max(latest, entry.estimatedEndMs),
+      0,
+    );
     if (cacheableDefinition) definitionDurationCache.set(cacheableDefinition, latestEndMs);
     return latestEndMs;
+  }
+
+  function namedMotionTimelineDurationMs() {
+    const latestStartMs = draftMotions.reduce(
+      (latest, motion) => Math.max(latest, motion.startMs),
+      0,
+    );
+    const contentEndMs = Math.max(
+      namedMotionCursorMs,
+      latestStartMs,
+      definitionDuration(draftMotions),
+      state.timelineRun?.surface === "namedAction" ? state.timelineRun.durationMs : 0,
+    );
+    return Math.min(
+      actionModel.MAX_START_MS,
+      Math.max(MIN_NAMED_MOTION_DURATION_MS, Math.ceil(contentEndMs / 1_000) * 1_000),
+    );
+  }
+
+  function namedMotionConflictIndexes() {
+    const buckets = new Map();
+    draftMotions.forEach((motion, index) => {
+      const key = `${motion.startMs}:${motion.nodeId}`;
+      const bucket = buckets.get(key) || [];
+      bucket.push(index);
+      buckets.set(key, bucket);
+    });
+    return new Set([...buckets.values()]
+      .filter((bucket) => bucket.length > 1)
+      .flat());
+  }
+
+  function namedMotionClipGeometry(motion, scheduled) {
+    const estimate = scheduled?.estimate || motionEstimate(motion);
+    const visibleDurationMs = Math.max(
+      1,
+      Math.min(estimate.durationMs, actionModel.MAX_START_MS - motion.startMs),
+    );
+    return {
+      estimate,
+      leftPx: motion.startMs / 1_000 * NAMED_MOTION_PIXELS_PER_SECOND,
+      widthPx: Math.max(
+        MIN_NAMED_MOTION_CLIP_WIDTH_PX,
+        visibleDurationMs / 1_000 * NAMED_MOTION_PIXELS_PER_SECOND,
+      ),
+    };
+  }
+
+  function packNamedMotionLane(entries, scheduleByIndex) {
+    const occupiedUntilByLayer = [];
+    return entries.map(({ index }) => {
+      const motion = draftMotions[index];
+      const scheduled = scheduleByIndex.get(index);
+      const geometry = namedMotionClipGeometry(motion, scheduled);
+      let layer = occupiedUntilByLayer.findIndex((occupiedUntil) => (
+        geometry.leftPx >= occupiedUntil + NAMED_MOTION_CLIP_GAP_PX
+      ));
+      if (layer < 0) layer = occupiedUntilByLayer.length;
+      occupiedUntilByLayer[layer] = geometry.leftPx + geometry.widthPx;
+      return { index, motion, scheduled, layer, ...geometry };
+    });
   }
 
   function maximumPlacementStartMs(definitionOrMotions) {
@@ -164,10 +250,16 @@
     return motions.map((motion) => ({ ...motion }));
   }
 
+  function resetNamedMotionTimeline() {
+    namedMotionCursorMs = 0;
+    namedMotionCursorDrag = null;
+    namedMotionClipDrag = null;
+  }
+
   function resetMotionEditor() {
     selectedDraftMotionIndex = null;
     motionDirection = 1;
-    byId("namedMotionStartInput").value = "0";
+    byId("namedMotionStartInput").value = String(namedMotionCursorMs);
     byId("namedMotionStepsInput").value = "1000";
     byId("namedMotionSpeedInput").value = "20";
     byId("namedMotionAccelerationInput").value = "20";
@@ -193,6 +285,7 @@
     draftDefinitionId = null;
     draftName = "";
     draftMotions = [];
+    resetNamedMotionTimeline();
     byId("namedActionNameInput").value = "";
     resetMotionEditor();
     renderAll();
@@ -212,6 +305,7 @@
     draftDefinitionId = currentDefinition.actionDefinitionId;
     draftName = currentDefinition.name;
     draftMotions = cloneMotions(currentDefinition.motions);
+    resetNamedMotionTimeline();
     selectedDraftMotionIndex = null;
     byId("namedActionNameInput").value = draftName;
     resetMotionEditor();
@@ -303,7 +397,9 @@
       if (draftMotions.length >= actionModel.MAX_MOTIONS_PER_DEFINITION) {
         throw new RangeError(`每个动作最多 ${actionModel.MAX_MOTIONS_PER_DEFINITION} 个电机运动`);
       }
-      draftMotions.push({ ...motionDraftFromForm() });
+      const motion = { ...motionDraftFromForm() };
+      draftMotions.push(motion);
+      namedMotionCursorMs = motion.startMs;
       selectedDraftMotionIndex = null;
       resetMotionEditor();
       renderAll();
@@ -313,10 +409,11 @@
     }
   }
 
-  function loadDraftMotion(index) {
+  function populateDraftMotionEditor(index) {
     const motion = draftMotions[index];
-    if (!motion || interactionLocked()) return;
+    if (!motion) return false;
     selectedDraftMotionIndex = index;
+    namedMotionCursorMs = motion.startMs;
     populateMotorSelect();
     byId("namedMotionMotorSelect").value = motion.motorId;
     byId("namedMotionStartInput").value = String(motion.startMs);
@@ -326,6 +423,11 @@
     byId("namedMotionLoopModeSelect").value = motion.closed ? "closed" : "open";
     setMotionDirection(motion.signedSteps < 0 ? -1 : 1);
     renderMotionBindingHint();
+    return true;
+  }
+
+  function loadDraftMotion(index) {
+    if (interactionLocked() || !populateDraftMotionEditor(index)) return;
     renderAll();
   }
 
@@ -333,10 +435,12 @@
     if (!Number.isInteger(selectedDraftMotionIndex) || !draftMotions[selectedDraftMotionIndex]) return;
     try {
       const previous = draftMotions[selectedDraftMotionIndex];
-      draftMotions[selectedDraftMotionIndex] = {
+      const updated = {
         ...(previous.motionId ? { motionId: previous.motionId } : {}),
         ...motionDraftFromForm(),
       };
+      draftMotions[selectedDraftMotionIndex] = updated;
+      namedMotionCursorMs = updated.startMs;
       selectedDraftMotionIndex = null;
       resetMotionEditor();
       renderAll();
@@ -456,7 +560,8 @@
       const name = document.createElement("b");
       name.textContent = definition.name;
       const detail = document.createElement("small");
-      detail.textContent = `${definition.motions.length} 个运动 · ${formatEstimatedDuration(definitionDuration(definition))}`;
+      const laneCount = new Set(definition.motions.map(({ motorId }) => motorId)).size;
+      detail.textContent = `${laneCount} 条电机轨 · ${definition.motions.length} 个运动 · ${formatEstimatedDuration(definitionDuration(definition))}`;
       const arrow = document.createElement("span");
       arrow.textContent = "›";
       item.append(name, detail, arrow);
@@ -485,55 +590,151 @@
     byId("namedActionDeleteButton").disabled = interactionLocked() || !draftDefinitionId;
   }
 
-  function renderMotionList() {
-    const rootElement = byId("namedMotionList");
-    rootElement.replaceChildren();
-    draftMotions.forEach((motion, index) => {
-      const row = document.createElement("div");
-      row.className = `named-motion-row${selectedDraftMotionIndex === index ? " selected" : ""}`;
-      row.dataset.motionIndex = String(index);
-      const time = document.createElement("span");
-      time.className = "named-motion-time";
-      time.textContent = formatTimelineTime(motion.startMs);
-      const motor = document.createElement("span");
-      motor.className = `named-motion-motor${motionBindingCurrent(motion) ? "" : " stale"}`;
-      const motorName = document.createElement("b");
-      motorName.textContent = motorById(motion.motorId)?.label || motion.motorId;
-      const motorMeta = document.createElement("small");
-      motorMeta.textContent = motionBindingCurrent(motion)
-        ? `ID ${motion.nodeId} · ${loopModeLabel(motion.closed)}`
-        : `保存 ID ${motion.nodeId} · 当前绑定已变化`;
-      motor.append(motorName, motorMeta);
-      const params = document.createElement("span");
-      params.className = "named-motion-params";
-      params.textContent = `${formatSigned(motion.signedSteps)} step\nV${motion.speed} / A${motion.acceleration}`;
-      const actions = document.createElement("span");
-      actions.className = "named-motion-row-actions";
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.className = "named-motion-edit-button";
-      edit.textContent = "编";
-      edit.title = "编辑这个电机运动";
-      const remove = document.createElement("button");
-      remove.type = "button";
-      remove.className = "named-motion-remove-button";
-      remove.textContent = "×";
-      remove.title = "从动作中删除";
-      actions.append(edit, remove);
-      row.append(time, motor, params, actions);
-      rootElement.append(row);
-    });
-    if (!draftMotions.length) {
-      const empty = document.createElement("p");
-      empty.className = "empty";
-      empty.textContent = "请添加一个或多个电机运动";
-      rootElement.append(empty);
-    }
+  function renderNamedMotionSummary() {
     byId("namedMotionCount").textContent = String(draftMotions.length);
     byId("namedActionEstimatedDuration").textContent = draftMotions.length
       ? formatEstimatedDuration(definitionDuration(draftMotions))
       : "—";
     byId("namedActionContentTitle").textContent = draftName.trim() || "未命名动作";
+  }
+
+  function renderNamedMotionTimelineRuler(visualDurationMs) {
+    const ruler = byId("namedMotionTimelineRuler");
+    ruler.replaceChildren();
+    const seconds = Math.ceil(visualDurationMs / 1_000);
+    const tickStepSeconds = seconds <= 20 ? 1 : seconds <= 60 ? 5 : seconds <= 180 ? 10 : 30;
+    for (let second = 0; second <= seconds; second += tickStepSeconds) {
+      const tick = document.createElement("span");
+      tick.className = "named-motion-ruler-tick";
+      tick.style.left = `${second * NAMED_MOTION_PIXELS_PER_SECOND}px`;
+      const label = document.createElement("span");
+      label.textContent = second < 60
+        ? `${second}s`
+        : `${Math.floor(second / 60)}:${String(second % 60).padStart(2, "0")}`;
+      tick.append(label);
+      ruler.append(tick);
+    }
+  }
+
+  function renderMotionList(schedule = motionSchedule(draftMotions)) {
+    const rootElement = byId("namedMotionList");
+    rootElement.replaceChildren();
+    const scheduleByIndex = new Map(schedule.map((entry) => [entry.index, entry]));
+    const conflictIndexes = namedMotionConflictIndexes();
+    const lanes = actionModel.deriveMotionLanes(
+      draftMotions,
+      state.motors.map(({ id }) => id),
+    );
+    const locked = interactionLocked();
+
+    for (const lane of lanes) {
+      const row = document.createElement("div");
+      row.className = "named-motion-track-row";
+      row.dataset.motorId = lane.motorId;
+      const motor = motorById(lane.motorId);
+      const currentNodeId = bindingNodeId(lane.motorId);
+      const laneIsStale = lane.entries.some(({ index }) => (
+        !motionBindingCurrent(draftMotions[index])
+      ));
+      const packedEntries = packNamedMotionLane(lane.entries, scheduleByIndex);
+      const layerCount = Math.max(1, ...packedEntries.map(({ layer }) => layer + 1));
+      const laneHeightPx = 8 + layerCount * NAMED_MOTION_CLIP_LAYER_STEP_PX;
+
+      const label = document.createElement("div");
+      label.className = `named-motion-track-label${laneIsStale ? " stale" : ""}`;
+      label.dataset.motorId = lane.motorId;
+      label.style.height = `${laneHeightPx}px`;
+      const name = document.createElement("b");
+      name.textContent = motor?.label || lane.motorId;
+      const meta = document.createElement("small");
+      meta.textContent = currentNodeId == null
+        ? `ID 未配置 · ${lane.entries.length} 个运动`
+        : `ID ${currentNodeId} · ${lane.entries.length} 个运动`;
+      label.append(name, meta);
+
+      const laneElement = document.createElement("div");
+      laneElement.className = "named-motion-track-lane";
+      laneElement.dataset.motorId = lane.motorId;
+      laneElement.style.height = `${laneHeightPx}px`;
+      for (const { index, motion, scheduled, estimate, leftPx, widthPx, layer } of packedEntries) {
+        const stale = !motionBindingCurrent(motion);
+        const queued = Number(scheduled?.queuedDelayMs) > 0;
+        const conflict = conflictIndexes.has(index);
+        const clip = document.createElement("div");
+        clip.className = `named-motion-clip ${motion.signedSteps < 0 ? "negative" : "positive"} ${motion.closed ? "closed-loop" : "open-loop"}${selectedDraftMotionIndex === index ? " selected" : ""}${queued ? " queued" : ""}${conflict ? " conflict" : ""}${stale ? " stale" : ""}`;
+        clip.dataset.motionIndex = String(index);
+        clip.dataset.overlapLayer = String(layer);
+        clip.style.left = `${leftPx}px`;
+        clip.style.top = `${6 + layer * NAMED_MOTION_CLIP_LAYER_STEP_PX}px`;
+        clip.style.width = `${widthPx}px`;
+        clip.style.height = `${NAMED_MOTION_CLIP_HEIGHT_PX}px`;
+        clip.tabIndex = locked ? -1 : 0;
+        clip.setAttribute("role", "button");
+        clip.setAttribute("aria-disabled", String(locked));
+        const motorName = motor?.label || motion.motorId;
+        clip.title = `${motorName} · 发送 ${formatTimelineTime(motion.startMs)} · 理论持续 ${formatEstimatedDuration(estimate.durationMs)} · 预计结束 ${formatTimelineTime(scheduled?.estimatedEndMs ?? motion.startMs + estimate.durationMs)} · ID ${motion.nodeId} · ${formatSigned(motion.signedSteps)} step · V${motion.speed}/A${motion.acceleration} · ${loopModeLabel(motion.closed)}${queued ? ` · 同 ID 排队约 ${formatEstimatedDuration(scheduled.queuedDelayMs)}` : ""}${conflict ? " · 同一物理 ID 在相同时刻存在冲突" : ""}${stale ? " · 当前绑定已变化" : ""}`;
+        clip.setAttribute("aria-label", `${clip.title}；单击编辑，左右拖动调整开始时间`);
+        const primary = document.createElement("b");
+        primary.textContent = `${formatSigned(motion.signedSteps)} · ${motion.startMs}ms`;
+        const secondary = document.createElement("small");
+        secondary.textContent = `${loopModeLabel(motion.closed)} · ID ${motion.nodeId} · V${motion.speed}/A${motion.acceleration}`;
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "named-motion-remove-button";
+        remove.dataset.motionIndex = String(index);
+        remove.textContent = "×";
+        remove.disabled = locked;
+        remove.title = `从动作中删除 ${motorName} 的这个运动`;
+        remove.setAttribute("aria-label", remove.title);
+        clip.append(primary, secondary, remove);
+        laneElement.append(clip);
+      }
+      row.append(label, laneElement);
+      rootElement.append(row);
+    }
+
+    if (!lanes.length) {
+      const empty = document.createElement("p");
+      empty.className = "named-motion-timeline-empty";
+      empty.textContent = "请添加一个或多个电机运动；每个动作都会拥有自己的独立时间轴";
+      rootElement.append(empty);
+    }
+    renderNamedMotionSummary();
+  }
+
+  function renderNamedMotionTimelineCursor(visualDurationMs = namedMotionTimelineDurationMs()) {
+    namedMotionCursorMs = Math.min(
+      actionModel.MAX_START_MS,
+      Math.max(0, namedMotionCursorMs),
+    );
+    const canvas = byId("namedMotionTimelineCanvas");
+    canvas.style.setProperty(
+      "--named-motion-playhead-x",
+      `${namedMotionCursorMs / 1_000 * NAMED_MOTION_PIXELS_PER_SECOND}px`,
+    );
+    byId("namedMotionCursorDisplay").textContent = formatTimelineTime(namedMotionCursorMs);
+    const playhead = byId("namedMotionTimelinePlayhead");
+    playhead.dataset.time = `${namedMotionCursorMs} ms`;
+    const ruler = byId("namedMotionTimelineRuler");
+    ruler.setAttribute("aria-valuemax", String(visualDurationMs));
+    ruler.setAttribute("aria-valuenow", String(namedMotionCursorMs));
+    ruler.setAttribute("aria-valuetext", `${namedMotionCursorMs} ms`);
+  }
+
+  function renderNamedMotionTimeline() {
+    const visualDurationMs = namedMotionTimelineDurationMs();
+    const timelineWidth = Math.max(
+      720,
+      visualDurationMs / 1_000 * NAMED_MOTION_PIXELS_PER_SECOND,
+    );
+    const canvas = byId("namedMotionTimelineCanvas");
+    canvas.style.setProperty("--named-motion-timeline-width", `${timelineWidth}px`);
+    canvas.style.setProperty("--named-motion-second-width", `${NAMED_MOTION_PIXELS_PER_SECOND}px`);
+    canvas.style.setProperty("--named-motion-minor-width", `${NAMED_MOTION_PIXELS_PER_SECOND / 10}px`);
+    byId("namedMotionSnapSelect").value = String(namedMotionSnapMs);
+    renderNamedMotionTimelineRuler(visualDurationMs);
+    renderMotionList();
+    renderNamedMotionTimelineCursor(visualDurationMs);
   }
 
   function renderMotionEditor() {
@@ -551,6 +752,9 @@
     byId("namedMotionUpdateButton").disabled = locked || nodeId == null;
     byId("namedMotionCancelEditButton").hidden = !Number.isInteger(selectedDraftMotionIndex);
     byId("namedMotionCancelEditButton").disabled = locked;
+    byId("namedMotionSnapSelect").disabled = locked;
+    byId("namedMotionTimelineRuler").tabIndex = locked ? -1 : 0;
+    byId("namedMotionTimelineRuler").setAttribute("aria-disabled", String(locked));
     renderMotionDirection();
     renderMotionBindingHint();
   }
@@ -578,10 +782,254 @@
     populateMotorSelect();
     renderDefinitionList();
     renderDefinitionForm();
-    renderMotionList();
+    renderNamedMotionTimeline();
     renderMotionEditor();
     renderEditorStatus();
     renderControls();
+  }
+
+  function followNamedMotionCursor() {
+    if (state.activePage !== "namedAction") return;
+    const scroller = byId("namedMotionTimelineScroller");
+    const canvasStyle = getComputedStyle(byId("namedMotionTimelineCanvas"));
+    const labelWidth = Number.parseFloat(
+      canvasStyle.getPropertyValue("--named-motion-label-width"),
+    ) || 0;
+    const cursorPixels = namedMotionCursorMs / 1_000 * NAMED_MOTION_PIXELS_PER_SECOND;
+    const contentX = labelWidth + cursorPixels;
+    const left = scroller.scrollLeft + labelWidth + 24;
+    const right = scroller.scrollLeft + scroller.clientWidth - 36;
+    if (contentX > right) scroller.scrollLeft = Math.max(0, contentX - scroller.clientWidth + 56);
+    else if (contentX < left) scroller.scrollLeft = Math.max(0, cursorPixels - 24);
+  }
+
+  function setNamedMotionCursorFromPointer(event, autoScroll = false) {
+    const scroller = byId("namedMotionTimelineScroller");
+    if (autoScroll) {
+      const bounds = scroller.getBoundingClientRect();
+      const canvasStyle = getComputedStyle(byId("namedMotionTimelineCanvas"));
+      const labelWidth = Number.parseFloat(
+        canvasStyle.getPropertyValue("--named-motion-label-width"),
+      ) || 0;
+      if (event.clientX < bounds.left + labelWidth + 24) {
+        scroller.scrollLeft = Math.max(0, scroller.scrollLeft - 18);
+      } else if (event.clientX > bounds.right - 28) {
+        scroller.scrollLeft += 18;
+      }
+    }
+    const rect = byId("namedMotionTimelineRuler").getBoundingClientRect();
+    const milliseconds = timelineModel.millisecondsFromPixels(
+      event.clientX - rect.left,
+      NAMED_MOTION_PIXELS_PER_SECOND,
+    );
+    namedMotionCursorMs = timelineModel.snapStartMs(
+      milliseconds,
+      event.altKey ? 0 : namedMotionSnapMs,
+      actionModel.MAX_START_MS,
+    );
+    byId("namedMotionStartInput").value = String(namedMotionCursorMs);
+    renderNamedMotionTimelineCursor();
+  }
+
+  function beginNamedMotionCursorDrag(event) {
+    if (interactionLocked() || event.button !== 0 || event.isPrimary === false) return;
+    event.preventDefault();
+    const ruler = byId("namedMotionTimelineRuler");
+    namedMotionCursorDrag = {
+      pointerId: event.pointerId,
+      originalCursorMs: namedMotionCursorMs,
+    };
+    ruler.classList.add("dragging");
+    byId("namedMotionTimelinePlayhead").classList.add("dragging");
+    try {
+      ruler.setPointerCapture(event.pointerId);
+    } catch (_) {
+      namedMotionCursorDrag = null;
+      ruler.classList.remove("dragging");
+      byId("namedMotionTimelinePlayhead").classList.remove("dragging");
+      return;
+    }
+    ruler.focus({ preventScroll: true });
+    setNamedMotionCursorFromPointer(event);
+  }
+
+  function moveNamedMotionCursorDrag(event) {
+    if (!namedMotionCursorDrag || namedMotionCursorDrag.pointerId !== event.pointerId) return;
+    if (interactionLocked()) return finishNamedMotionCursorDrag(event, true);
+    event.preventDefault();
+    setNamedMotionCursorFromPointer(event, true);
+  }
+
+  function finishNamedMotionCursorDrag(event, canceled = false) {
+    if (!namedMotionCursorDrag || namedMotionCursorDrag.pointerId !== event.pointerId) return;
+    const drag = namedMotionCursorDrag;
+    if (!canceled && !interactionLocked()) setNamedMotionCursorFromPointer(event);
+    else {
+      namedMotionCursorMs = drag.originalCursorMs;
+      byId("namedMotionStartInput").value = String(namedMotionCursorMs);
+    }
+    namedMotionCursorDrag = null;
+    const ruler = byId("namedMotionTimelineRuler");
+    ruler.classList.remove("dragging");
+    byId("namedMotionTimelinePlayhead").classList.remove("dragging");
+    try {
+      if (ruler.hasPointerCapture(event.pointerId)) ruler.releasePointerCapture(event.pointerId);
+    } catch (_) {
+      // Capture may already be gone after a page switch or window blur.
+    }
+    renderNamedMotionTimeline();
+  }
+
+  function moveNamedMotionCursorWithKeyboard(event) {
+    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key) || interactionLocked()) return;
+    event.preventDefault();
+    const step = namedMotionSnapMs || 50;
+    if (event.key === "Home") namedMotionCursorMs = 0;
+    else if (event.key === "End") namedMotionCursorMs = namedMotionTimelineDurationMs();
+    else {
+      namedMotionCursorMs = Math.min(
+        actionModel.MAX_START_MS,
+        Math.max(0, namedMotionCursorMs + (event.key === "ArrowLeft" ? -step : step)),
+      );
+    }
+    byId("namedMotionStartInput").value = String(namedMotionCursorMs);
+    renderNamedMotionTimeline();
+    followNamedMotionCursor();
+  }
+
+  function syncNamedMotionCursorFromInput() {
+    const startMs = Number(byId("namedMotionStartInput").value);
+    if (!Number.isSafeInteger(startMs) || startMs < 0 || startMs > actionModel.MAX_START_MS) return;
+    const currentVisualDurationMs = Number(
+      byId("namedMotionTimelineRuler").getAttribute("aria-valuemax"),
+    ) || MIN_NAMED_MOTION_DURATION_MS;
+    namedMotionCursorMs = startMs;
+    if (startMs > currentVisualDurationMs) renderNamedMotionTimeline();
+    else renderNamedMotionTimelineCursor(currentVisualDurationMs);
+    followNamedMotionCursor();
+  }
+
+  function beginNamedMotionClipDrag(event) {
+    if (event.target.closest(".named-motion-remove-button")) return;
+    const clip = event.target.closest(".named-motion-clip");
+    if (!clip || interactionLocked() || event.button !== 0 || event.isPrimary === false) return;
+    const index = Number(clip.dataset.motionIndex);
+    let motion = draftMotions[index];
+    if (!motion) return;
+    event.preventDefault();
+    if (selectedDraftMotionIndex === index) {
+      try {
+        motion = {
+          ...(motion.motionId ? { motionId: motion.motionId } : {}),
+          ...motionDraftFromForm(),
+        };
+        draftMotions[index] = motion;
+      } catch (error) {
+        toast(`请先修正当前运动参数：${errorMessage(error)}`, "error");
+        return;
+      }
+    } else {
+      populateDraftMotionEditor(index);
+    }
+    for (const candidate of document.querySelectorAll(".named-motion-clip.selected")) {
+      candidate.classList.toggle("selected", candidate === clip);
+    }
+    renderDefinitionForm();
+    renderMotionEditor();
+    renderEditorStatus();
+    renderControls();
+    renderNamedMotionTimelineCursor();
+    try {
+      clip.setPointerCapture(event.pointerId);
+    } catch (_) {
+      return;
+    }
+    clip.classList.add("dragging");
+    namedMotionClipDrag = {
+      pointerId: event.pointerId,
+      clip,
+      index,
+      motion,
+      originalStartMs: motion.startMs,
+      previewStartMs: motion.startMs,
+      startClientX: event.clientX,
+      startScrollLeft: byId("namedMotionTimelineScroller").scrollLeft,
+    };
+  }
+
+  function moveNamedMotionClipDrag(event) {
+    if (!namedMotionClipDrag || namedMotionClipDrag.pointerId !== event.pointerId) return;
+    if (interactionLocked()) return finishNamedMotionClipDrag(event, true);
+    event.preventDefault();
+    const scroller = byId("namedMotionTimelineScroller");
+    const bounds = scroller.getBoundingClientRect();
+    if (event.clientX < bounds.left + 28) scroller.scrollLeft = Math.max(0, scroller.scrollLeft - 18);
+    else if (event.clientX > bounds.right - 28) scroller.scrollLeft += 18;
+    namedMotionClipDrag.previewStartMs = timelineModel.shiftTimelineStartMs(
+      namedMotionClipDrag.originalStartMs,
+      event.clientX - namedMotionClipDrag.startClientX,
+      scroller.scrollLeft - namedMotionClipDrag.startScrollLeft,
+      NAMED_MOTION_PIXELS_PER_SECOND,
+      event.altKey ? 0 : namedMotionSnapMs,
+      actionModel.MAX_START_MS,
+    );
+    namedMotionClipDrag.clip.style.left = `${namedMotionClipDrag.previewStartMs / 1_000 * NAMED_MOTION_PIXELS_PER_SECOND}px`;
+    namedMotionCursorMs = namedMotionClipDrag.previewStartMs;
+    byId("namedMotionStartInput").value = String(namedMotionCursorMs);
+    renderNamedMotionTimelineCursor();
+  }
+
+  function finishNamedMotionClipDrag(event, canceled = false) {
+    if (!namedMotionClipDrag || namedMotionClipDrag.pointerId !== event.pointerId) return;
+    const drag = namedMotionClipDrag;
+    namedMotionClipDrag = null;
+    try {
+      if (drag.clip.hasPointerCapture(event.pointerId)) drag.clip.releasePointerCapture(event.pointerId);
+    } catch (_) {
+      // Capture may already be gone after a page switch or window blur.
+    }
+    const targetIsCurrent = draftMotions[drag.index] === drag.motion;
+    const changed = targetIsCurrent && drag.previewStartMs !== drag.originalStartMs;
+    if (!canceled && !interactionLocked() && changed) {
+      draftMotions[drag.index] = {
+        ...actionModel.validateMotion({
+          ...drag.motion,
+          startMs: drag.previewStartMs,
+        }),
+      };
+      selectedDraftMotionIndex = drag.index;
+      namedMotionCursorMs = drag.previewStartMs;
+      populateDraftMotionEditor(drag.index);
+    } else {
+      namedMotionCursorMs = drag.originalStartMs;
+      if (targetIsCurrent) populateDraftMotionEditor(drag.index);
+    }
+    renderAll();
+    if (!canceled && changed) toast("运动开始时间已调整；保存当前动作后生效");
+  }
+
+  function handleNamedMotionTimelineClick(event) {
+    const remove = event.target.closest(".named-motion-remove-button");
+    if (remove) {
+      removeDraftMotion(Number(remove.dataset.motionIndex));
+      return;
+    }
+    const clip = event.target.closest(".named-motion-clip");
+    if (clip) loadDraftMotion(Number(clip.dataset.motionIndex));
+  }
+
+  function handleNamedMotionTimelineKeydown(event) {
+    if (event.target.closest(".named-motion-remove-button")) return;
+    const clip = event.target.closest(".named-motion-clip");
+    if (!clip || interactionLocked()) return;
+    const index = Number(clip.dataset.motionIndex);
+    if (event.key === "Enter" || event.key === " ") {
+      event.preventDefault();
+      loadDraftMotion(index);
+    } else if (event.key === "Delete" || event.key === "Backspace") {
+      event.preventDefault();
+      removeDraftMotion(index);
+    }
   }
 
   function expandedSequence(placements = sequence.snapshot()) {
@@ -949,7 +1397,7 @@
       || draftMotions.some((motion) => !motionBindingCurrent(motion))
       || draftHasConflicts;
     byId("namedActionStopButton").disabled = state.timelineRun?.surface !== "namedAction" || state.disconnecting;
-    for (const item of document.querySelectorAll(".named-action-definition-item, .named-motion-row-actions button")) {
+    for (const item of document.querySelectorAll(".named-action-definition-item, .named-motion-remove-button")) {
       item.disabled = locked;
     }
     renderMotionEditor();
@@ -1906,6 +2354,7 @@
       draftDefinitionId = selectedDefinitionId;
       draftName = firstDefinition?.name || "";
       draftMotions = firstDefinition ? cloneMotions(firstDefinition.motions) : [];
+      resetNamedMotionTimeline();
       selectedDraftMotionIndex = null;
       definitionDurationCache = new WeakMap();
       ensureDurationCoversSequence();
@@ -1965,6 +2414,9 @@
     if (run.surface === "actionTimeline") {
       cursorMs = 0;
       byId("actionTimelineScroller").scrollLeft = 0;
+    } else if (run.surface === "namedAction") {
+      namedMotionCursorMs = 0;
+      byId("namedMotionTimelineScroller").scrollLeft = 0;
     }
   }
 
@@ -1973,6 +2425,10 @@
       cursorMs = Math.min(run.durationMs, Math.round(elapsed));
       renderActionTimelineCursor();
       followActionTimelineCursor();
+    } else if (run.surface === "namedAction") {
+      namedMotionCursorMs = Math.min(run.durationMs, Math.round(elapsed));
+      renderNamedMotionTimelineCursor();
+      followNamedMotionCursor();
     }
   }
 
@@ -1986,6 +2442,7 @@
 
   function finishPlayback(run) {
     if (run.surface === "actionTimeline") cursorMs = run.durationMs;
+    if (run.surface === "namedAction") namedMotionCursorMs = run.durationMs;
   }
 
   function renderPlaybackSurface(run) {
@@ -1994,6 +2451,12 @@
   }
 
   function cancelInteractions() {
+    if (namedMotionCursorDrag) {
+      finishNamedMotionCursorDrag({ pointerId: namedMotionCursorDrag.pointerId }, true);
+    }
+    if (namedMotionClipDrag) {
+      finishNamedMotionClipDrag({ pointerId: namedMotionClipDrag.pointerId }, true);
+    }
     if (cursorDrag) finishCursorDrag({ pointerId: cursorDrag.pointerId }, true);
     if (placementDrag) finishPlacementDrag({ pointerId: placementDrag.pointerId }, true);
     if (paletteDragDefinitionId) finishPaletteDrag();
@@ -2004,6 +2467,7 @@
     if (!initialized || profileRefreshHandle != null) return;
     profileRefreshHandle = requestAnimationFrame(() => {
       profileRefreshHandle = null;
+      if (namedMotionCursorDrag || namedMotionClipDrag) cancelInteractions();
       const previousDurationMs = durationMs;
       ensureDurationCoversSequence();
       if (durationMs !== previousDurationMs) persistState();
@@ -2048,11 +2512,13 @@
       draftName = "";
       draftMotions = [];
       selectedDraftMotionIndex = null;
+      resetNamedMotionTimeline();
     } else {
       const keptDraftMotions = draftMotions.filter(({ motorId }) => allowedMotorIds.has(motorId));
       if (keptDraftMotions.length !== draftMotions.length) {
         draftMotions = keptDraftMotions;
         selectedDraftMotionIndex = null;
+        resetNamedMotionTimeline();
       }
     }
     if (affectedIds.has(selectedTimelineDefinitionId)) {
@@ -2240,6 +2706,7 @@
       draftName = "";
       draftMotions = [];
     }
+    resetNamedMotionTimeline();
     resetMotionEditor();
     renderAll();
   }
@@ -2255,7 +2722,7 @@
     byId("namedActionNameInput").addEventListener("input", (event) => {
       draftName = event.target.value;
       renderDefinitionForm();
-      renderMotionList();
+      renderNamedMotionSummary();
       renderControls();
     });
     byId("namedActionSaveButton").addEventListener("click", saveDefinition);
@@ -2267,6 +2734,12 @@
     byId("namedMotionMotorSelect").addEventListener("change", () => {
       renderMotionBindingHint();
       renderMotionEditor();
+    });
+    byId("namedMotionStartInput").addEventListener("input", syncNamedMotionCursorFromInput);
+    byId("namedMotionSnapSelect").addEventListener("change", (event) => {
+      const next = Number(event.target.value);
+      if (!SNAP_OPTIONS.has(next)) return;
+      namedMotionSnapMs = next;
     });
     byId("namedMotionDirectionButtons").addEventListener("click", (event) => {
       const button = event.target.closest(".named-motion-direction-button");
@@ -2281,13 +2754,20 @@
       resetMotionEditor();
       renderAll();
     });
-    byId("namedMotionList").addEventListener("click", (event) => {
-      const row = event.target.closest(".named-motion-row");
-      if (!row) return;
-      const index = Number(row.dataset.motionIndex);
-      if (event.target.closest(".named-motion-edit-button")) loadDraftMotion(index);
-      if (event.target.closest(".named-motion-remove-button")) removeDraftMotion(index);
-    });
+    byId("namedMotionTimelineRuler").addEventListener("pointerdown", beginNamedMotionCursorDrag);
+    byId("namedMotionTimelinePlayheadHandle").addEventListener("pointerdown", beginNamedMotionCursorDrag);
+    byId("namedMotionTimelineRuler").addEventListener("pointermove", moveNamedMotionCursorDrag);
+    byId("namedMotionTimelineRuler").addEventListener("pointerup", (event) => finishNamedMotionCursorDrag(event));
+    byId("namedMotionTimelineRuler").addEventListener("pointercancel", (event) => finishNamedMotionCursorDrag(event, true));
+    byId("namedMotionTimelineRuler").addEventListener("lostpointercapture", (event) => finishNamedMotionCursorDrag(event, true));
+    byId("namedMotionTimelineRuler").addEventListener("keydown", moveNamedMotionCursorWithKeyboard);
+    byId("namedMotionList").addEventListener("pointerdown", beginNamedMotionClipDrag);
+    byId("namedMotionList").addEventListener("pointermove", moveNamedMotionClipDrag);
+    byId("namedMotionList").addEventListener("pointerup", (event) => finishNamedMotionClipDrag(event));
+    byId("namedMotionList").addEventListener("pointercancel", (event) => finishNamedMotionClipDrag(event, true));
+    byId("namedMotionList").addEventListener("lostpointercapture", (event) => finishNamedMotionClipDrag(event, true));
+    byId("namedMotionList").addEventListener("click", handleNamedMotionTimelineClick);
+    byId("namedMotionList").addEventListener("keydown", handleNamedMotionTimelineKeydown);
     byId("namedMotionTestButton").addEventListener("click", () => void testCurrentMotion());
     byId("namedActionTestButton").addEventListener("click", () => void testDraftDefinition());
     byId("namedActionStopButton").addEventListener("click", () => void stopTimelinePlayback("用户停止动作编辑测试"));

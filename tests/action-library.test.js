@@ -18,6 +18,7 @@ const {
   ActionLibrary,
   ActionTrackCatalog,
   NamedActionTimeline,
+  deriveMotionLanes,
   validateActionDefinition,
   validateActionTrack,
   validateMotion,
@@ -138,6 +139,66 @@ test("an action definition can combine motors and multiple times", () => {
   assert.deepEqual(blink.motions.map(({ startMs }) => startMs), [0, 0, 180, 180]);
   assert.equal(new Set(blink.motions.map(({ motionId }) => motionId)).size, 4);
   assert.ok(blink.motions.every(({ motionId }) => motionId.startsWith("motion-")));
+});
+
+test("motion lanes group the same logical motor and keep different motors separate", () => {
+  const lanes = deriveMotionLanes([
+    motion({ motionId: "left-late", motorId: "left_upper_eyelid", nodeId: 42, startMs: 300 }),
+    motion({ motionId: "right-now", motorId: "right_upper_eyelid", nodeId: 42, startMs: 0 }),
+    motion({ motionId: "left-now", motorId: "left_upper_eyelid", nodeId: 42, startMs: 0 }),
+  ], ["right_upper_eyelid", "left_upper_eyelid"]);
+
+  assert.equal(lanes.length, 2, "a repeated CAN ID must not merge different logical motors");
+  assert.deepEqual(lanes.map(({ motorId }) => motorId), [
+    "right_upper_eyelid",
+    "left_upper_eyelid",
+  ]);
+  assert.deepEqual(lanes[0].entries.map(({ index }) => index), [1]);
+  assert.deepEqual(lanes[1].entries.map(({ index }) => index), [2, 0]);
+  assert.deepEqual(lanes[1].entries.map(({ motion: entry }) => entry.motionId), [
+    "left-now",
+    "left-late",
+  ]);
+  assert.ok(Object.isFrozen(lanes));
+  assert.ok(Object.isFrozen(lanes[1]));
+  assert.ok(Object.isFrozen(lanes[1].entries));
+});
+
+test("motion lane derivation validates inputs without adding persisted fields", () => {
+  const source = [motion({ motionId: "saved-motion", startMs: 250 })];
+  const [lane] = deriveMotionLanes(source);
+  assert.deepEqual(Object.keys(lane).sort(), ["entries", "motorId"]);
+  assert.deepEqual(Object.keys(lane.entries[0]).sort(), ["index", "motion"]);
+  assert.deepEqual(lane.entries[0].motion, validateMotion(source[0]));
+  assert.throws(() => deriveMotionLanes({}), /动作运动片段必须是数组/);
+  assert.throws(() => deriveMotionLanes(source, {}), /电机顺序必须是数组/);
+});
+
+test("legacy named-action snapshots round-trip before deriving independent lanes", () => {
+  const legacySnapshot = [{
+    actionDefinitionId: "saved-blink",
+    name: "眨眼",
+    motions: [
+      motion({ motionId: "left-close", motorId: "left_upper_eyelid", nodeId: 42, startMs: 0 }),
+      motion({ motionId: "right-close", motorId: "right_upper_eyelid", nodeId: 42, startMs: 0 }),
+      motion({ motionId: "left-open", motorId: "left_upper_eyelid", nodeId: 42, startMs: 250 }),
+    ],
+  }];
+  const roundTripped = new ActionLibrary(legacySnapshot).snapshot();
+
+  assert.deepEqual(roundTripped, legacySnapshot);
+  assert.deepEqual(
+    deriveMotionLanes(roundTripped[0].motions).map((lane) => ({
+      motorId: lane.motorId,
+      motionIds: lane.entries.map(({ motion: entry }) => entry.motionId),
+    })),
+    [
+      { motorId: "left_upper_eyelid", motionIds: ["left-close", "left-open"] },
+      { motorId: "right_upper_eyelid", motionIds: ["right-close"] },
+    ],
+  );
+  assert.equal(JSON.stringify(roundTripped).includes("lanes"), false,
+    "derived lane metadata must never enter saved or exported definitions");
 });
 
 test("action names are unique after trimming and Unicode normalization", () => {
@@ -421,5 +482,6 @@ test("UMD build exposes action library, placement timeline, and track catalog mo
   assert.equal(typeof context.FaceActionLibrary.ActionLibrary, "function");
   assert.equal(typeof context.FaceActionLibrary.NamedActionTimeline, "function");
   assert.equal(typeof context.FaceActionLibrary.ActionTrackCatalog, "function");
+  assert.equal(typeof context.FaceActionLibrary.deriveMotionLanes, "function");
   assert.ok(Object.isFrozen(context.FaceActionLibrary));
 });

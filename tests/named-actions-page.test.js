@@ -59,12 +59,15 @@ test("动作编辑 builds a named action from one or many independently timed mo
     "namedMotionMotorSelect", "namedMotionStartInput", "namedMotionStepsInput",
     "namedMotionSpeedInput", "namedMotionAccelerationInput", "namedMotionLoopModeSelect",
     "namedMotionAddButton", "namedMotionList", "namedMotionTestButton", "namedActionTestButton",
+    "namedMotionSnapSelect", "namedMotionTimelineScroller", "namedMotionTimelineCanvas",
+    "namedMotionTimelineRuler", "namedMotionTimelinePlayhead",
   ]) assert.match(page, new RegExp(`id="${id}"`));
   assert.match(page, /id="namedMotionLoopModeSelect"[\s\S]*value="open"[^>]*selected[^>]*>开环<[\s\S]*value="closed"[^>]*>闭环</);
   assert.match(page, /id="namedMotionStartInput"[^>]*min="0"[^>]*max="600000"/);
 
   const addMotion = functionSource(controller, "addDraftMotion");
-  assert.match(addMotion, /draftMotions\.push\(\{\s*\.\.\.motionDraftFromForm\(\)\s*\}\)/);
+  assert.match(addMotion, /const motion\s*=\s*\{\s*\.\.\.motionDraftFromForm\(\)\s*\}/);
+  assert.match(addMotion, /draftMotions\.push\(motion\)/);
   assert.match(addMotion, /MAX_MOTIONS_PER_DEFINITION/);
   const save = functionSource(controller, "saveDefinition");
   assert.match(save, /library\.update\(draftDefinitionId, input\)/);
@@ -73,7 +76,97 @@ test("动作编辑 builds a named action from one or many independently timed mo
   assert.match(functionSource(controller, "testCurrentMotion"), /playExpandedPlan/);
   assert.match(functionSource(controller, "testDraftDefinition"), /playExpandedPlan/);
   assert.match(styles, /\.named-action-page\b/);
-  assert.match(styles, /\.named-motion-row\b/);
+  assert.match(styles, /\.named-motion-timeline-canvas\b/);
+  assert.match(styles, /\.named-motion-track-lane\b/);
+  assert.match(styles, /\.named-motion-clip\b/);
+});
+
+test("each named action renders an independent mini timeline grouped by logical motor", () => {
+  const render = functionSource(controller, "renderMotionList");
+  assert.match(render, /actionModel\.deriveMotionLanes\(/);
+  assert.match(render, /state\.motors\.map\(\(\{ id \}\) => id\)/,
+    "lane ordering should follow the configured motor catalog");
+  assert.match(render, /row\.dataset\.motorId\s*=\s*lane\.motorId/);
+  assert.match(render, /laneElement\.dataset\.motorId\s*=\s*lane\.motorId/);
+  assert.match(render, /clip\.dataset\.motionIndex\s*=\s*String\(index\)/,
+    "grouping must retain the original draft index for editing and deletion");
+  assert.match(render, /clip\.dataset\.overlapLayer\s*=\s*String\(layer\)/,
+    "overlapping movements must remain reachable inside their shared motor lane");
+  assert.match(render, /named-motion-track-row/);
+  assert.match(render, /named-motion-track-label/);
+  assert.match(render, /named-motion-track-lane/);
+  assert.match(render, /named-motion-clip/);
+
+  const geometry = functionSource(controller, "namedMotionClipGeometry");
+  assert.match(geometry, /motion\.startMs\s*\/\s*1_000\s*\*\s*NAMED_MOTION_PIXELS_PER_SECOND/);
+  assert.match(geometry, /visibleDurationMs\s*\/\s*1_000\s*\*\s*NAMED_MOTION_PIXELS_PER_SECOND/);
+  const packing = functionSource(controller, "packNamedMotionLane");
+  assert.match(packing, /occupiedUntilByLayer/);
+  assert.match(packing, /NAMED_MOTION_CLIP_GAP_PX/);
+
+  const definitionList = functionSource(controller, "renderDefinitionList");
+  assert.match(definitionList, /new Set\(definition\.motions\.map\(\(\{ motorId \}\) => motorId\)\)\.size/);
+  assert.match(definitionList, /条电机轨/);
+
+  for (const functionName of ["startNewDefinition", "loadDefinition", "initialize"]) {
+    assert.match(functionSource(controller, functionName), /resetNamedMotionTimeline\(\)/,
+      `${functionName} must reset action-local cursor and drag state`);
+  }
+  assert.match(functionSource(controller, "importActionTimelineProject"), /resetNamedMotionTimeline\(\)/,
+    "importing another library must reset action-local cursor and drag state");
+});
+
+test("named-action mini timeline supports cursor positioning and horizontal clip dragging", () => {
+  const pointerTime = functionSource(controller, "setNamedMotionCursorFromPointer");
+  assert.match(pointerTime, /millisecondsFromPixels\(/);
+  assert.match(pointerTime, /event\.clientX\s*-\s*rect\.left/);
+  assert.match(pointerTime, /event\.altKey\s*\?\s*0\s*:\s*namedMotionSnapMs/);
+  assert.match(pointerTime, /namedMotionStartInput/);
+
+  const move = functionSource(controller, "moveNamedMotionClipDrag");
+  assert.match(move, /startClientX/);
+  assert.match(move, /startScrollLeft/);
+  assert.match(move, /shiftTimelineStartMs\(/);
+  assert.match(move, /previewStartMs/);
+
+  const begin = functionSource(controller, "beginNamedMotionClipDrag");
+  assert.match(begin, /selectedDraftMotionIndex\s*===\s*index/);
+  assert.match(begin, /motionDraftFromForm\(\)/,
+    "dragging a selected block must retain valid edits already made in the parameter form");
+
+  const finish = functionSource(controller, "finishNamedMotionClipDrag");
+  assert.match(finish, /draftMotions\[drag\.index\]\s*=\s*\{/);
+  assert.match(finish, /validateMotion\(\{/);
+  assert.match(finish, /\.\.\.drag\.motion/,
+    "dragging must preserve the motor, ID, steps, speed, acceleration, mode, and stable motion ID");
+  assert.match(finish, /startMs:\s*drag\.previewStartMs/);
+  assert.doesNotMatch(finish, /persistState/,
+    "dragging edits only the draft until the user saves the named action");
+
+  const events = functionSource(controller, "initEvents");
+  assert.match(events, /namedMotionTimelineRuler[\s\S]*addEventListener\("pointerdown"/);
+  assert.match(events, /namedMotionList[\s\S]*addEventListener\("pointerdown"/);
+  assert.match(events, /namedMotionList[\s\S]*addEventListener\("pointermove"/);
+  assert.match(events, /namedMotionList[\s\S]*addEventListener\("pointerup"/);
+  assert.match(events, /namedMotionList[\s\S]*addEventListener\("pointercancel"/);
+
+  const keydown = functionSource(controller, "handleNamedMotionTimelineKeydown");
+  assert.match(keydown, /closest\("\.named-motion-remove-button"\)/,
+    "the delete button must retain its native Enter/Space click behavior");
+});
+
+test("testing a named action drives its own mini-timeline playhead", () => {
+  const prepare = functionSource(controller, "preparePlayback");
+  assert.match(prepare, /run\.surface\s*===\s*"namedAction"/);
+  assert.match(prepare, /namedMotionCursorMs\s*=\s*0/);
+  assert.match(prepare, /namedMotionTimelineScroller/);
+  const update = functionSource(controller, "updatePlaybackCursor");
+  assert.match(update, /run\.surface\s*===\s*"namedAction"/);
+  assert.match(update, /renderNamedMotionTimelineCursor\(\)/);
+  assert.match(update, /followNamedMotionCursor\(\)/);
+  const cancel = functionSource(controller, "cancelInteractions");
+  assert.match(cancel, /finishNamedMotionCursorDrag/);
+  assert.match(cancel, /finishNamedMotionClipDrag/);
 });
 
 test("动作时间轴 uses a visible searchable action palette instead of a select", () => {
@@ -292,6 +385,8 @@ test("motor catalog replacement removes whole affected definitions and their pla
   const reconcile = functionSource(controller, "reconcileMotorCatalog");
   assert.match(reconcile, /sequence\.remove\(placement\.placementId\)/);
   assert.match(reconcile, /library\.remove\(actionDefinitionId\)/);
+  assert.match(reconcile, /resetNamedMotionTimeline\(\)/,
+    "clearing or filtering the current action must reset its local mini timeline");
   assert.match(functionSource(app, "installMotorCatalog"), /window\.LumNamedActions\.reconcileMotorCatalog\(allowedMotorIds\)/);
 });
 
