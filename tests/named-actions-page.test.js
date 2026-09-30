@@ -27,6 +27,15 @@ function pageSource(pageId, nextMarker) {
   return html.slice(start, end);
 }
 
+function selectOptionValues(source, id) {
+  const start = source.indexOf(`<select id="${id}"`);
+  assert.ok(start >= 0, `${id} must exist`);
+  const end = source.indexOf("</select>", start);
+  assert.ok(end > start, `${id} must close`);
+  return [...source.slice(start, end).matchAll(/<option\b[^>]*\bvalue="([^"]+)"/g)]
+    .map(([, value]) => value);
+}
+
 test("named action scripts load before the application and expose one controller boundary", () => {
   const modelIndex = html.indexOf('src="../src/action-library.js"');
   const controllerIndex = html.indexOf('src="named-actions.js"');
@@ -205,6 +214,74 @@ test("动作时间轴 uses a visible searchable action palette instead of a sele
   assert.match(styles, /\.action-timeline-stage\b/);
 });
 
+test("动作时间轴 exposes the same connection-origin recovery action", () => {
+  const page = pageSource("actionTimelinePage", '<div id="motorCreateModal"');
+  assert.match(
+    page,
+    /id="actionTimelineReturnOriginButton"[^>]*class="[^"]*timeline-return-origin-button[^"]*"[^>]*disabled[^>]*>\s*↶\s*恢复起点\s*</,
+  );
+  assert.match(page, /actionTimelineReturnOriginButton[^>]*title="[^"]*本次连接起点[^"]*"/);
+
+  const events = functionSource(app, "initEvents");
+  assert.match(events, /timelineReturnOriginButton["']\)\.addEventListener\(["']click["'],\s*\(\)\s*=>\s*void\s+returnToOrigin\(\)\)/);
+  assert.match(events, /actionTimelineReturnOriginButton["']\)\.addEventListener\(["']click["'],\s*\(\)\s*=>\s*void\s+returnToOrigin\(\)\)/);
+  assert.equal(
+    (events.match(/=>\s*void\s+returnToOrigin\(\)/g) || []).length,
+    3,
+    "motor control and both timeline pages must invoke one shared recovery operation",
+  );
+});
+
+test("动作时间轴 exposes mutually exclusive time and motor-parameter playback scaling", () => {
+  const page = pageSource("actionTimelinePage", '<div id="motorCreateModal"');
+  for (const id of [
+    "actionTimelinePlaybackOptions",
+    "actionTimelineRateModeSelect",
+    "actionTimelineSlowerButton",
+    "actionTimelineRateSelect",
+    "actionTimelineFasterButton",
+    "actionTimelineRateTargetSelect",
+    "actionTimelineRateHint",
+  ]) assert.match(page, new RegExp(`id="${id}"`));
+
+  assert.deepEqual(
+    selectOptionValues(page, "actionTimelineRateModeSelect"),
+    ["time", "parameters"],
+    "one select keeps the two playback modes mutually exclusive",
+  );
+  assert.deepEqual(
+    selectOptionValues(page, "actionTimelineRateSelect"),
+    ["0.25", "0.5", "0.75", "1", "1.25", "1.5", "2"],
+    "the rate control must expose every supported slow/normal/fast preset in order",
+  );
+  assert.deepEqual(
+    selectOptionValues(page, "actionTimelineRateTargetSelect"),
+    ["speed", "acceleration", "both"],
+  );
+  assert.match(page, /id="actionTimelineSlowerButton"[^>]*>[^<]*慢放/);
+  assert.match(page, /id="actionTimelineFasterButton"[^>]*>[^<]*快放/);
+  assert.match(page, /id="actionTimelineRateTargetSelect"[^>]*disabled/,
+    "time scaling is the default and must not expose an active parameter target");
+
+  const render = functionSource(controller, "renderActionTimelinePlaybackControls");
+  assert.match(render, /modeSelect\.disabled\s*=\s*locked/);
+  assert.match(render, /rateSelect\.disabled\s*=\s*locked/);
+  assert.match(render, /targetSelect\.disabled\s*=\s*locked\s*\|\|\s*settings\.mode\s*!==\s*["']parameters["']/);
+  assert.match(render, /slowerButton\.disabled\s*=\s*locked\s*\|\|\s*rateIndex\s*<=\s*0/,
+    "the slow button must stop at the 0.25x boundary");
+  assert.match(render, /fasterButton\.disabled\s*=\s*locked[\s\S]{0,100}rateIndex\s*>=\s*rates\.length\s*-\s*1/,
+    "the fast button must stop at the 2x boundary");
+  assert.match(functionSource(controller, "renderActionTimelineControls"),
+    /renderActionTimelinePlaybackControls\(locked\)/);
+
+  const events = functionSource(controller, "initEvents");
+  assert.match(events, /actionTimelineRateModeSelect[\s\S]*updateActionTimelinePlaybackSettings\(\{\s*mode:/);
+  assert.match(events, /actionTimelineRateSelect[\s\S]*updateActionTimelinePlaybackSettings\(\{\s*rate:/);
+  assert.match(events, /actionTimelineRateTargetSelect[\s\S]*updateActionTimelinePlaybackSettings\(\{\s*parameterTarget:/);
+  assert.match(events, /actionTimelineSlowerButton[\s\S]*stepActionTimelinePlaybackRate\(-1\)/);
+  assert.match(events, /actionTimelineFasterButton[\s\S]*stepActionTimelinePlaybackRate\(1\)/);
+});
+
 test("action palette cards select, double-click to add, and drag onto an exact timeline time", () => {
   const select = functionSource(controller, "selectPaletteDefinition");
   assert.match(select, /closest\(["']\.action-palette-card["']\)/);
@@ -323,6 +400,65 @@ test("same-time actions remain parallel across tracks while physical CAN ID conf
   assert.match(functionSource(app, "dispatchTimelineGroup"), /Promise\.all\(group\.items\.map/);
 });
 
+test("only full action-timeline playback applies one immutable runtime scaling plan", () => {
+  const playTimeline = functionSource(controller, "playActionTimeline");
+  assert.match(playTimeline, /playbackSettings:\s*actionTimelinePlaybackSettings/);
+  assert.match(playTimeline, /playbackRevision:\s*actionTimelinePlaybackRevision/);
+  for (const testFunction of ["testCurrentMotion", "testDraftDefinition"]) {
+    const source = functionSource(controller, testFunction);
+    assert.match(source, /surface:\s*["']namedAction["']/);
+    assert.doesNotMatch(source, /playbackSettings|playbackRevision/,
+      `${testFunction} must retain the saved named action's original timing and parameters`);
+  }
+
+  const transform = functionSource(controller, "expandedPlanForActionPlayback");
+  assert.match(transform, /actionModel\.motionForActionPlayback\(entry\.motion,\s*settings\)/);
+  assert.match(transform, /actionModel\.actionPlaybackStartMs\(entry\.startMs,\s*settings\)/);
+
+  const play = functionSource(controller, "playExpandedPlan");
+  const validateAuthorPlan = play.indexOf("validateExpandedPlan(expanded)");
+  const transformPlan = play.indexOf("expandedPlanForActionPlayback(expanded, playbackSettings)");
+  const validateRuntimePlan = play.indexOf("validateExpandedPlan(effectiveExpanded", transformPlan);
+  const groupRuntimePlan = play.indexOf("groupsFromExpanded(effectiveExpanded)", validateRuntimePlan);
+  const preflight = play.indexOf("await requireIdleNodes(commands)", groupRuntimePlan);
+  const revisionGuard = play.indexOf("actionTimelinePlaybackRevision", preflight);
+  assert.ok(
+    validateAuthorPlan >= 0
+      && transformPlan > validateAuthorPlan
+      && validateRuntimePlan > transformPlan
+      && groupRuntimePlan > validateRuntimePlan,
+    "validate saved author data first, then transform and conflict-check the runtime plan before grouping",
+  );
+  assert.ok(preflight > groupRuntimePlan && revisionGuard > preflight,
+    "a playback-setting revision change during asynchronous preflight must cancel the captured plan");
+  assert.match(play.slice(preflight), /playbackRevision\s*!==\s*options\.playbackRevision/);
+  assert.match(play, /\bsourceDurationMs(?:\s*:\s*sourceDurationMs)?\s*,/);
+  assert.match(play, /cursorTimeScale:\s*playbackSettings\?\.mode\s*===\s*["']time["'][^?]*\?\s*playbackSettings\.rate\s*:\s*1/);
+  assert.match(play, /playbackSummary,/);
+  assert.match(play, /playbackLogDetail,/);
+});
+
+test("scaled action playback keeps wall-clock duration separate from the authored cursor", () => {
+  const update = functionSource(controller, "updatePlaybackCursor");
+  assert.match(update, /const sourceDurationMs\s*=\s*run\.sourceDurationMs\s*\|\|\s*run\.durationMs/);
+  assert.match(update, /Math\.round\(elapsed\s*\*\s*cursorTimeScale\)/);
+  assert.match(update, /Math\.min\(sourceDurationMs,/,
+    "fast playback must still finish at the original timeline coordinate");
+  const finish = functionSource(controller, "finishPlayback");
+  assert.match(finish, /cursorMs\s*=\s*run\.sourceDurationMs\s*\|\|\s*run\.durationMs/);
+
+  const launch = functionSource(app, "launchNamedTimelineRun");
+  assert.match(launch, /durationMs:\s*options\.durationMs/);
+  assert.match(launch, /sourceDurationMs:\s*options\.sourceDurationMs\s*\|\|\s*options\.durationMs/);
+  assert.match(launch, /cursorTimeScale:\s*options\.cursorTimeScale\s*\|\|\s*1/);
+  assert.match(launch, /playbackSummary:\s*options\.playbackSummary\s*\|\|\s*["']["']/);
+  assert.match(launch, /playbackLogDetail:\s*options\.playbackLogDetail\s*\|\|\s*["']["']/);
+  assert.match(launch, /addLog\([\s\S]*run\.playbackLogDetail/,
+    "the start log must explain the selected runtime scaling");
+  assert.match(functionSource(app, "finishTimelinePlayback"), /run\.playbackSummary/,
+    "the completion log must retain the captured playback summary");
+});
+
 test("schema 12 stores action timeline schema 2 tracks and placements separately", () => {
   const persisted = functionSource(app, "persistedStateDocument");
   assert.match(persisted, /schemaVersion:\s*12/);
@@ -425,7 +561,14 @@ test("high-level placements cannot schedule an internal motor send past 600000 m
   assert.match(drag, /maximumPlacementStartMs\(/);
   assert.match(drag, /timelineModel\.snapStartMs\([\s\S]*Math\.min\(durationMs,\s*maximumStartMs\)/,
     "horizontal drag must clamp its preview using the dragged definition's legal start");
-  assert.match(functionSource(controller, "validateExpandedPlan"), /startMs\s*>\s*actionModel\.MAX_START_MS/);
+  const validateExpanded = functionSource(controller, "validateExpandedPlan");
+  assert.match(validateExpanded, /maximumStartMs\s*=\s*actionModel\.MAX_START_MS/,
+    "author plans retain the persisted 600000 ms boundary by default");
+  assert.match(validateExpanded, /startMs\s*>\s*maximumStartMs/,
+    "runtime time scaling may supply its correspondingly scaled scheduling boundary");
+  const playback = functionSource(controller, "playExpandedPlan");
+  assert.match(playback, /actionPlaybackStartMs\(actionModel\.MAX_START_MS,\s*playbackSettings\)/);
+  assert.match(playback, /validateExpandedPlan\(effectiveExpanded,\s*maximumEffectiveStartMs\)/);
 });
 
 test("connecting CAN proactively loads every named-action motion profile on any active page", () => {

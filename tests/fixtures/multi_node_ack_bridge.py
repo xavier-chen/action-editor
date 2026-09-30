@@ -59,6 +59,7 @@ for line in sys.stdin:
             "connected": True,
             "nodeId": default_node,
             "simulate": True,
+            "sessionEpoch": session_epoch,
         })
         continue
 

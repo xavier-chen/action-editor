@@ -59,11 +59,18 @@ class TransportFailureTests(unittest.TestCase):
         self.assertIsNone(service.transport)
         self.assertEqual(transport.closed, 1)
         self.assertEqual(service.pending_parameters, {})
-        self.assertIn(("error", {"message": "fatal rx"}), self.events)
+        self.assertIn(
+            ("error", {"message": "fatal rx", "sessionEpoch": 0}),
+            self.events,
+        )
         self.assertIn(
             (
                 "connection",
-                {"connected": False, "reason": "transport-error"},
+                {
+                    "connected": False,
+                    "reason": "transport-error",
+                    "sessionEpoch": 0,
+                },
             ),
             self.events,
         )
@@ -83,6 +90,36 @@ class TransportFailureTests(unittest.TestCase):
         self.assertTrue(service.connected)
         self.assertIs(service.transport, current)
         self.assertEqual(current.closed, 0)
+
+    def test_received_frames_keep_the_transport_session_that_produced_them(self):
+        service = BRIDGE.MotorService()
+        service.session_epoch = 9
+        status_a = BRIDGE.frame(
+            BRIDGE.STATUS_A_BASE | 17,
+            bytes((2, 0, 0, 4)) + bytes(4),
+        )
+
+        service._receive_frame(status_a, 7)
+
+        frame_event = next(data for event, data in self.events if event == "frame")
+        status_event = next(data for event, data in self.events if event == "status")
+        self.assertEqual(frame_event["sessionEpoch"], 7)
+        self.assertEqual(status_event["sessionEpoch"], 7)
+        self.assertNotEqual(status_event["sessionEpoch"], service.session_epoch)
+
+    def test_decode_errors_keep_the_transport_session_that_produced_them(self):
+        service = BRIDGE.MotorService()
+        service.session_epoch = 9
+        item = BRIDGE.frame(BRIDGE.STATUS_A_BASE | 17, bytes(8))
+        service._decode = lambda _item: (_ for _ in ()).throw(ValueError("bad frame"))
+
+        service._receive_frame(item, 7)
+
+        error_event = next(data for event, data in self.events if event == "error")
+        self.assertEqual(error_event, {
+            "message": "协议解码失败: bad frame",
+            "sessionEpoch": 7,
+        })
 
 
 class FirmwareUpdateBridgeTests(unittest.TestCase):

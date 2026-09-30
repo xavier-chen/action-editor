@@ -195,11 +195,38 @@
     return encodeURIComponent(value).replaceAll("%", "_");
   }
 
+  function setSummaryValue(summary, key, value) {
+    Object.defineProperty(summary, key, {
+      value,
+      writable: true,
+      enumerable: true,
+      configurable: true,
+    });
+  }
+
+  function frozenPositionSummary(positions, keyForEntry = (key) => key) {
+    const summary = {};
+    for (const [key, steps] of positions) {
+      if (steps !== 0) setSummaryValue(summary, keyForEntry(key), steps);
+    }
+    return Object.freeze(summary);
+  }
+
   class CommandLedger {
     constructor() {
       this._entries = [];
       this._nextEntryNumber = 1;
       this._revision = 0;
+      // These compact indexes make status rendering proportional to the number
+      // of configured motors/nodes, rather than to the unbounded command log.
+      // Zero-valued keys are retained so positionSummary keeps the historical
+      // first-seen property order used by the former log scan.
+      this._motorPositions = new Map();
+      this._nodePositions = new Map();
+      this._latestNodeEntries = new Map();
+      this._positionSummaryCache = null;
+      this._nodePositionSummaryCache = null;
+      this._returnCommandsCache = null;
     }
 
     get size() {
@@ -209,6 +236,14 @@
     _append(command, actual, source) {
       const steps = actualSteps(command, actual);
       if (steps === 0) return null;
+      const motorPosition = safePositionAdd(
+        this._motorPositions.get(command.motorId) || 0,
+        steps,
+      );
+      const nodePosition = safePositionAdd(
+        this._nodePositions.get(command.nodeId) || 0,
+        steps,
+      );
       const entry = Object.freeze({
         entryId: `entry-${String(this._nextEntryNumber).padStart(6, "0")}`,
         commandId: command.commandId || null,
@@ -222,6 +257,11 @@
       });
       this._nextEntryNumber += 1;
       this._entries.push(entry);
+      this._motorPositions.set(entry.motorId, motorPosition);
+      this._nodePositions.set(entry.nodeId, nodePosition);
+      // Map insertion order doubles as the node's latest-activity order.
+      this._latestNodeEntries.delete(entry.nodeId);
+      this._latestNodeEntries.set(entry.nodeId, entry);
       this._revision += 1;
       return entry;
     }
@@ -236,62 +276,35 @@
     }
 
     positionSummary() {
-      const positions = {};
-      for (const entry of this._entries) {
-        const next = safePositionAdd(
-          Object.hasOwn(positions, entry.motorId) ? positions[entry.motorId] : 0,
-          entry.signedSteps,
-        );
-        Object.defineProperty(positions, entry.motorId, {
-          value: next,
-          writable: true,
-          enumerable: true,
-          configurable: true,
-        });
+      if (this._positionSummaryCache?.revision !== this._revision) {
+        this._positionSummaryCache = {
+          revision: this._revision,
+          value: frozenPositionSummary(this._motorPositions),
+        };
       }
-      for (const [motorId, steps] of Object.entries(positions)) {
-        if (steps === 0) delete positions[motorId];
-      }
-      return Object.freeze(positions);
+      return this._positionSummaryCache.value;
     }
 
     nodePositionSummary() {
-      const positions = {};
-      for (const entry of this._entries) {
-        const nodeKey = String(entry.nodeId);
-        const next = safePositionAdd(
-          Object.hasOwn(positions, nodeKey) ? positions[nodeKey] : 0,
-          entry.signedSteps,
-        );
-        Object.defineProperty(positions, nodeKey, {
-          value: next,
-          writable: true,
-          enumerable: true,
-          configurable: true,
-        });
+      if (this._nodePositionSummaryCache?.revision !== this._revision) {
+        this._nodePositionSummaryCache = {
+          revision: this._revision,
+          value: frozenPositionSummary(this._nodePositions, String),
+        };
       }
-      for (const [nodeId, steps] of Object.entries(positions)) {
-        if (steps === 0) delete positions[nodeId];
-      }
-      return Object.freeze(positions);
+      return this._nodePositionSummaryCache.value;
     }
 
     createReturnCommands() {
-      const positions = this.nodePositionSummary();
-      const latest = new Map();
-      const nodeOrder = [];
-      for (let index = this._entries.length - 1; index >= 0; index -= 1) {
-        const entry = this._entries[index];
-        const nodeKey = String(entry.nodeId);
-        if (!Object.hasOwn(positions, nodeKey) || latest.has(entry.nodeId)) continue;
-        latest.set(entry.nodeId, entry);
-        nodeOrder.push(entry.nodeId);
+      if (this._returnCommandsCache?.revision === this._revision) {
+        return this._returnCommandsCache.value;
       }
 
       const commands = [];
-      for (const nodeId of nodeOrder) {
-        const recent = latest.get(nodeId);
-        let remaining = -positions[String(nodeId)];
+      const latestEntries = Array.from(this._latestNodeEntries.values()).reverse();
+      for (const recent of latestEntries) {
+        const nodeId = recent.nodeId;
+        let remaining = -(this._nodePositions.get(nodeId) || 0);
         let chunk = 1;
         while (remaining !== 0) {
           const signedSteps = Math.sign(remaining) * Math.min(
@@ -311,7 +324,9 @@
           chunk += 1;
         }
       }
-      return freezeArray(commands);
+      const value = freezeArray(commands);
+      this._returnCommandsCache = { revision: this._revision, value };
+      return value;
     }
 
     markReturnResults(commands, results) {
@@ -351,6 +366,9 @@
     clear() {
       const removed = this.size;
       this._entries.length = 0;
+      this._motorPositions.clear();
+      this._nodePositions.clear();
+      this._latestNodeEntries.clear();
       this._revision += 1;
       return removed;
     }

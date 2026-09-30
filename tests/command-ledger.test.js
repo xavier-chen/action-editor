@@ -207,6 +207,81 @@ test("return commands aggregate per physical node in reverse activity order with
   assert.deepEqual(ledger.createReturnCommands(), returns, "unchanged ledger has stable return IDs");
 });
 
+test("ledger summaries and return plans are revision-cached, frozen, and safely reusable", () => {
+  const ledger = new CommandLedger();
+  ledger.recordSuccess(command({ signedSteps: 100 }));
+  ledger.recordSuccess(command({
+    motorId: "neck",
+    nodeId: 22,
+    signedSteps: -40,
+    speed: 44,
+    acceleration: 55,
+  }));
+
+  const positions = ledger.positionSummary();
+  const nodes = ledger.nodePositionSummary();
+  const returns = ledger.createReturnCommands();
+  assert.strictEqual(ledger.positionSummary(), positions);
+  assert.strictEqual(ledger.nodePositionSummary(), nodes);
+  assert.strictEqual(ledger.createReturnCommands(), returns);
+  assert.ok(Object.isFrozen(positions));
+  assert.ok(Object.isFrozen(nodes));
+  assert.ok(Object.isFrozen(returns));
+  assert.ok(returns.every(Object.isFrozen));
+
+  assert.throws(() => { positions.neck = 999; }, TypeError);
+  assert.throws(() => { nodes[22] = 999; }, TypeError);
+  assert.throws(() => { returns.pop(); }, TypeError);
+  assert.throws(() => { returns[0].signedSteps = 999; }, TypeError);
+  assert.deepEqual(ledger.positionSummary(), { left_brow_outer: 100, neck: -40 });
+  assert.deepEqual(ledger.nodePositionSummary(), { 12: 100, 22: -40 });
+
+  assert.equal(ledger.recordSuccess(command(), { actualSignedSteps: 0 }), null);
+  assert.strictEqual(ledger.positionSummary(), positions, "zero motion does not change the revision");
+  assert.strictEqual(ledger.nodePositionSummary(), nodes);
+  assert.strictEqual(ledger.createReturnCommands(), returns);
+
+  ledger.recordSuccess(command({ signedSteps: 25 }));
+  assert.notStrictEqual(ledger.positionSummary(), positions);
+  assert.notStrictEqual(ledger.nodePositionSummary(), nodes);
+  assert.notStrictEqual(ledger.createReturnCommands(), returns);
+});
+
+test("ledger aggregate reads never rescan command history", () => {
+  const ledger = new CommandLedger();
+  for (let index = 0; index < 2000; index += 1) {
+    ledger.recordSuccess(command({
+      motorId: `motor-${index % 20}`,
+      nodeId: (index % 20) + 1,
+      signedSteps: index % 3 === 0 ? -2 : 1,
+      speed: (index % 100) + 1,
+      acceleration: ((index * 3) % 100) + 1,
+    }));
+  }
+
+  let historyReads = 0;
+  ledger._entries = new Proxy(ledger._entries, {
+    get(target, property, receiver) {
+      if (property === Symbol.iterator || property === "length" || /^\d+$/.test(String(property))) {
+        historyReads += 1;
+      }
+      return Reflect.get(target, property, receiver);
+    },
+  });
+
+  const positions = ledger.positionSummary();
+  const nodes = ledger.nodePositionSummary();
+  const returns = ledger.createReturnCommands();
+  assert.equal(historyReads, 0);
+  assert.equal(Object.keys(positions).length, 20);
+  assert.equal(Object.keys(nodes).length, 20);
+  assert.equal(returns.length, 20);
+  assert.strictEqual(ledger.positionSummary(), positions);
+  assert.strictEqual(ledger.nodePositionSummary(), nodes);
+  assert.strictEqual(ledger.createReturnCommands(), returns);
+  assert.equal(historyReads, 0);
+});
+
 test("return commands merge repeated bindings by physical CAN node", () => {
   const ledger = new CommandLedger();
   ledger.recordSuccess(command({

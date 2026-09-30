@@ -37,7 +37,6 @@ const DEFAULT_TIMELINE_SNAP_MS = 100;
 const DEFAULT_TIMELINE_PIXELS_PER_SECOND = 120;
 const DEFAULT_NODE_QUEUE_CAPACITY = 64;
 const TIMELINE_MAX_LATE_MS = 250;
-const MOTION_ACK_TIMEOUT_MS = 1_000;
 const TIMELINE_SNAP_OPTIONS = new Set([0, 50, 100, 250, 500, 1_000]);
 const PAGE_DEFINITIONS = Object.freeze([
   Object.freeze({ id: "motor", tabId: "motorControlTab", panelId: "motorControlPage" }),
@@ -63,8 +62,11 @@ const state = {
   activeOperation: "",
   operationEpoch: 0,
   connectionEpoch: 0,
-  statusPolling: false,
+  driverSessionEpoch: null,
+  statusPolling: null,
   originReliable: false,
+  originReturnPreparing: false,
+  originSetPreparing: false,
   pendingOriginNodes: new Set(),
   originCompletionMessage: "",
   interfaceName: "can0",
@@ -99,8 +101,6 @@ const state = {
   timelineDrag: null,
   timelineRun: null,
   timelineTest: null,
-  motionAckWaiters: new Map(),
-  motionAckCache: new Map(),
 };
 
 const motorRows = new Map();
@@ -154,6 +154,18 @@ function timelineTrackIsEnabled(motorId) {
 
 function configuredNodeIds() {
   return [...new Set(motorIds().map(bindingNodeId).filter(Number.isInteger))];
+}
+
+function nodeIdSignature(nodes = configuredNodeIds()) {
+  return [...nodes].map(Number).filter(Number.isInteger).sort((left, right) => left - right).join(",");
+}
+
+function driverEventIsCurrent(data) {
+  return Boolean(
+    state.connected
+    && Number.isInteger(state.driverSessionEpoch)
+    && Number(data?.sessionEpoch) === state.driverSessionEpoch
+  );
 }
 
 function nodePositionSummary() {
@@ -2262,6 +2274,7 @@ function switchPage(page) {
   if (state.activePage === "namedAction" || state.activePage === "actionTimeline") {
     window.LumNamedActions.renderPage(state.activePage);
   }
+  renderOrigin();
 }
 
 function saveTimelineAction(updateSelected = false) {
@@ -2562,12 +2575,13 @@ function nodeStatusIsFreshAndIdle(
 
 function scheduleMotorStatusUiRefresh() {
   motorStatusUiDirty = true;
-  if (state.activePage !== "motor" || motorStatusRenderHandle != null) return;
+  if (motorStatusRenderHandle != null) return;
   motorStatusRenderHandle = requestAnimationFrame(() => {
     motorStatusRenderHandle = null;
-    if (state.activePage !== "motor" || !motorStatusUiDirty) return;
-    motorStatusUiDirty = false;
-    refreshMotorRows();
+    if (state.activePage === "motor" && motorStatusUiDirty) {
+      motorStatusUiDirty = false;
+      refreshMotorRows();
+    }
     renderOrigin();
   });
 }
@@ -2577,6 +2591,7 @@ function flushMotorStatusUiRefresh(force = false) {
   motorStatusRenderHandle = null;
   if (state.activePage !== "motor") {
     motorStatusUiDirty = true;
+    renderOrigin();
     return;
   }
   if (!force && !motorStatusUiDirty) return;
@@ -2656,40 +2671,88 @@ function resolvePendingOriginStatus() {
   addLog("success", "回起点", state.originCompletionMessage);
 }
 
-function renderOrigin() {
-  resolvePendingOriginStatus();
-  if (state.activePage !== "motor") {
-    motorStatusUiDirty = true;
-    return;
-  }
+function originViewState() {
+  const configuredNodes = configuredNodeIds();
   const entries = Object.entries(nodePositionSummary()).filter(([, value]) => Number(value) !== 0);
   const total = entries.reduce((sum, [, value]) => sum + Math.abs(Number(value)), 0);
   const returnCommands = state.originReliable ? state.ledger.createReturnCommands() : [];
   const returnNodes = [...new Set(returnCommands.map(({ nodeId }) => nodeId))];
   const pendingNodes = [...state.pendingOriginNodes];
   const busyNodes = returnNodes.filter((nodeId) => !nodeStatusIsFreshAndIdle(nodeId));
+  let summary;
+  if (!state.connected) summary = "尚未连接 CAN";
+  else if (!configuredNodes.length) summary = "尚未配置电机 ID，无法建立物理起点";
+  else if (!state.originReliable) {
+    summary = state.connecting
+      ? "正在确认所有已配置节点静止且 FIFO 为空…"
+      : "没有可靠的起点记录，请确认机械安全后重新设置本地起点";
+  }
+  else if (pendingNodes.length) summary = `补偿已入队，等待节点 ${pendingNodes.join("、")} 执行完成`;
+  else if (!entries.length) summary = state.originCompletionMessage || "所有已跟踪 CAN 节点都在本地参考起点";
+  else if (busyNodes.length) summary = `等待节点 ${busyNodes.join("、")} 的状态更新或 FIFO 清空`;
+  else summary = `${entries.length} 个 CAN 节点偏离起点，共 ${total} step`;
 
-  $("originSummary").textContent = !state.originReliable
-    ? "当前位置未知，请确认机械安全后重新设置本地起点"
-    : pendingNodes.length
-      ? `补偿已入队，等待节点 ${pendingNodes.join("、")} 执行完成`
-      : entries.length === 0
-        ? (state.originCompletionMessage || "所有已跟踪 CAN 节点都在本地参考起点")
-        : busyNodes.length
-          ? `等待节点 ${busyNodes.join("、")} 的状态更新或 FIFO 清空`
-          : `${entries.length} 个 CAN 节点偏离起点，共 ${total} step`;
-
-  $("setOriginButton").disabled = !state.connected || state.disconnecting || state.busy || state.configIoBusy;
-  $("returnOriginButton").disabled = !(
+  const canReturn = Boolean(
     state.connected
+    && !state.connecting
     && !state.disconnecting
     && !state.busy
     && !state.configIoBusy
+    && !state.originReturnPreparing
+    && !state.originSetPreparing
     && state.originReliable
-    && entries.length > 0
-    && pendingNodes.length === 0
-    && busyNodes.length === 0
+    && entries.length
+    && returnCommands.length
+    && !pendingNodes.length
+    && !busyNodes.length
   );
+  let returnTitle = summary;
+  if (canReturn) {
+    returnTitle = `按驱动板已确认接收的运动指令，恢复 ${entries.length} 个 CAN 节点、共 ${total} step 到本次连接起点`;
+  } else if (state.connected && !state.originReliable) {
+    returnTitle = configuredNodes.length
+      ? "没有可靠的起点记录；请到电机控制页确认机械安全后重新设置起点"
+      : summary;
+  } else if (
+    state.busy
+    || state.configIoBusy
+    || state.connecting
+    || state.disconnecting
+    || state.originReturnPreparing
+    || state.originSetPreparing
+  ) {
+    returnTitle = `请等待当前操作完成；${summary}`;
+  }
+  return { entries, total, returnCommands, returnNodes, pendingNodes, busyNodes, summary, canReturn, returnTitle };
+}
+
+function renderOriginReturnButtons(view) {
+  for (const id of ["returnOriginButton", "timelineReturnOriginButton", "actionTimelineReturnOriginButton"]) {
+    const button = $(id);
+    if (!button) continue;
+    button.disabled = !view.canReturn;
+    button.title = view.returnTitle;
+    button.setAttribute("aria-label", view.returnTitle);
+  }
+}
+
+function renderOrigin() {
+  resolvePendingOriginStatus();
+  const view = originViewState();
+  renderOriginReturnButtons(view);
+  if (state.activePage !== "motor") {
+    motorStatusUiDirty = true;
+    return;
+  }
+  $("originSummary").textContent = view.summary;
+  $("setOriginButton").disabled = !state.connected
+    || state.connecting
+    || state.disconnecting
+    || state.busy
+    || state.configIoBusy
+    || state.originReturnPreparing
+    || state.originSetPreparing
+    || configuredNodeIds().length === 0;
 }
 
 function commandBindingCurrent(command) {
@@ -2718,7 +2781,9 @@ function renderConnection() {
     ? (state.simulate ? "仿真已连接" : `${state.interfaceName} 已连接`)
     : "未连接";
   $("connectButton").disabled = state.connected || state.connecting || state.disconnecting || state.busy || state.configIoBusy;
-  $("connectButton").textContent = state.connecting ? "连接中…" : "连接 CAN";
+  $("connectButton").textContent = state.connecting
+    ? (state.connected ? "确认起点…" : "连接中…")
+    : "连接 CAN";
   $("disconnectButton").disabled = !state.connected || state.disconnecting || state.busy;
   $("disconnectButton").textContent = state.disconnecting ? "断开中…" : "断开";
   $("emergencyButton").disabled = !state.connected || state.disconnecting;
@@ -2802,7 +2867,6 @@ function beginOperation(label) {
 
 function beginInterruptOperation(label) {
   state.operationEpoch += 1;
-  cancelMotionAckWaiters(`${label} 已取消等待中的动作 ACK`);
   state.busy = true;
   state.activeOperation = label;
   renderConnection();
@@ -2814,62 +2878,6 @@ function finishOperation(token) {
   state.busy = false;
   state.activeOperation = "";
   renderConnection();
-}
-
-function motionAckKey(nodeId, sequence) {
-  return `${nodeId}:${sequence}`;
-}
-
-function receiveMotionAck(data) {
-  const key = motionAckKey(data.nodeId, data.sequence);
-  const waiter = state.motionAckWaiters.get(key);
-  if (waiter && waiter.connectionEpoch === state.connectionEpoch) {
-    clearTimeout(waiter.timer);
-    state.motionAckWaiters.delete(key);
-    waiter.resolve(data);
-    return;
-  }
-  state.motionAckCache.set(key, {
-    data,
-    connectionEpoch: state.connectionEpoch,
-    expiresAt: Date.now() + MOTION_ACK_TIMEOUT_MS,
-  });
-}
-
-function waitForMotionAck(nodeId, sequence) {
-  const key = motionAckKey(nodeId, sequence);
-  const cached = state.motionAckCache.get(key);
-  if (cached) state.motionAckCache.delete(key);
-  if (
-    cached
-    && cached.connectionEpoch === state.connectionEpoch
-    && cached.expiresAt >= Date.now()
-  ) return Promise.resolve(cached.data);
-
-  const connectionEpoch = state.connectionEpoch;
-  return new Promise((resolve, reject) => {
-    const previous = state.motionAckWaiters.get(key);
-    if (previous) {
-      clearTimeout(previous.timer);
-      previous.reject(new Error(`节点 ${nodeId} 的动作序号 ${sequence} 被重复使用`));
-    }
-    const timer = setTimeout(() => {
-      const current = state.motionAckWaiters.get(key);
-      if (current?.timer === timer) state.motionAckWaiters.delete(key);
-      reject(new Error(`节点 ${nodeId} 的动作序号 ${sequence} 等待 ACK 超时`));
-    }, MOTION_ACK_TIMEOUT_MS);
-    state.motionAckWaiters.set(key, { resolve, reject, timer, connectionEpoch });
-  });
-}
-
-function cancelMotionAckWaiters(reason) {
-  const error = new Error(reason);
-  for (const waiter of state.motionAckWaiters.values()) {
-    clearTimeout(waiter.timer);
-    waiter.reject(error);
-  }
-  state.motionAckWaiters.clear();
-  state.motionAckCache.clear();
 }
 
 async function transmit(command, source, options = {}) {
@@ -2896,14 +2904,25 @@ async function transmit(command, source, options = {}) {
     addLog("error", source, error.message, render);
     return { ok: false, error };
   }
-  let motionSent = false;
+  const transmitConnectionEpoch = state.connectionEpoch;
+  let motionMayHaveBeenSent = false;
   try {
+    // Crossing the IPC/bridge boundary means a rejected promise cannot prove
+    // that the CAN frame stayed off the wire. Keep this conservative so a
+    // later origin return can never compensate an untracked possible motion.
+    motionMayHaveBeenSent = true;
     const result = await api.move(payload);
-    motionSent = true;
     if (!Number.isInteger(result?.sequence)) throw new Error("桥接层没有返回动作序号");
-    const ack = await waitForMotionAck(command.nodeId, result.sequence);
-    if (!ack.ok) {
-      throw new Error(`节点 ${command.nodeId} 拒绝动作序号 ${result.sequence}：${ack.statusName || `状态 ${ack.status}`}`);
+    const ack = result?.ack;
+    const expectedCommandClass = command.closed ? 2 : 1;
+    if (
+      ack?.ok !== true
+      || Number(ack.nodeId) !== command.nodeId
+      || Number(ack.commandClass) !== expectedCommandClass
+      || Number(ack.opcode) !== 0
+      || Number(ack.sequence) !== result.sequence
+    ) {
+      throw new Error(`节点 ${command.nodeId} 的动作 ACK 身份或状态不匹配`);
     }
     const interrupted = operationToken !== state.operationEpoch;
     if (recordLedger && !interrupted) {
@@ -2944,8 +2963,13 @@ async function transmit(command, source, options = {}) {
     }
     return { ok: true, interrupted, result, ack, acceptedAt };
   } catch (error) {
-    if (motionSent && operationToken === state.operationEpoch && state.originReliable) {
-      invalidateOrigin(`节点 ${command.nodeId} 的动作 ACK 未确认`);
+    if (
+      motionMayHaveBeenSent
+      && transmitConnectionEpoch === state.connectionEpoch
+      && state.connected
+      && state.originReliable
+    ) {
+      invalidateOrigin(`节点 ${command.nodeId} 的动作执行状态未确认`);
     }
     if (trackProgramStats) {
       const stats = state.programStats.get(command.commandId) || { count: 0, last: "" };
@@ -3025,7 +3049,11 @@ function finishTimelinePlayback(run) {
   renderLogs();
   refreshMotorRows();
   renderOrigin();
-  addLog("success", timelineRunSource(run), `播放完成 · ${run.actionCount} 个电机运动 · ${run.involvedNodes.length} 个物理节点`);
+  addLog(
+    "success",
+    timelineRunSource(run),
+    `播放完成 · ${run.actionCount} 个电机运动 · ${run.involvedNodes.length} 个物理节点${run.playbackSummary ? ` · ${run.playbackSummary}` : ""}`,
+  );
   finishOperation(run.token);
   renderTimelineRunSurface(run);
   toast(`${run.completionLabel || "时间轨播放完成"}：${run.actionCount} 个电机运动`);
@@ -3249,6 +3277,8 @@ function launchNamedTimelineRun(options) {
     phase: "playing",
     startedAt: null,
     durationMs: options.durationMs,
+    sourceDurationMs: options.sourceDurationMs || options.durationMs,
+    cursorTimeScale: options.cursorTimeScale || 1,
     groups: options.groups,
     nextGroupIndex: 0,
     pending: new Set(),
@@ -3264,13 +3294,15 @@ function launchNamedTimelineRun(options) {
     requireTimelineTrackEnabled: false,
     placementCount: options.placementCount || 0,
     definitionCount: options.definitionCount || 0,
+    playbackSummary: options.playbackSummary || "",
+    playbackLogDetail: options.playbackLogDetail || "",
   };
   state.timelineRun = run;
   window.LumNamedActions.preparePlayback(run);
   addLog(
     "success",
     timelineRunSource(run),
-    `开始播放 · ${run.actionCount} 个电机运动 · ${run.involvedNodes.length} 个物理节点 · 时长 ${formatTimelineTime(run.durationMs)}`,
+    `开始播放 · ${run.actionCount} 个电机运动 · ${run.involvedNodes.length} 个物理节点 · 时长 ${formatTimelineTime(run.durationMs)}${run.playbackLogDetail ? ` · ${run.playbackLogDetail}` : ""}`,
   );
   renderTimelineRunSurface(run);
   run.startedAt = performance.now();
@@ -3531,8 +3563,19 @@ function delay(milliseconds) {
 
 async function requireIdleNodeIds(nodes) {
   const uniqueNodes = [...new Set(nodes.map(Number).filter(Number.isInteger))];
+  if (!uniqueNodes.length) {
+    toast("尚未配置电机 ID，无法确认物理起点", "warning");
+    return false;
+  }
+  const connectionEpoch = state.connectionEpoch;
+  const driverSessionEpoch = state.driverSessionEpoch;
   const requestedAt = Date.now();
   for (let index = 0; index < uniqueNodes.length; index += 16) {
+    if (
+      !state.connected
+      || state.connectionEpoch !== connectionEpoch
+      || state.driverSessionEpoch !== driverSessionEpoch
+    ) return false;
     try {
       await api.statusMany(uniqueNodes.slice(index, index + 16), 0x09);
     } catch (error) {
@@ -3541,6 +3584,11 @@ async function requireIdleNodeIds(nodes) {
     }
   }
   await delay(150);
+  if (
+    !state.connected
+    || state.connectionEpoch !== connectionEpoch
+    || state.driverSessionEpoch !== driverSessionEpoch
+  ) return false;
   const unavailable = uniqueNodes.filter((nodeId) => !nodeStatusIsFreshAndIdle(nodeId, requestedAt));
   if (unavailable.length) {
     toast(`节点 ${unavailable.join("、")} 尚有动作、故障或未返回完整新状态，请等待并重试`, "warning");
@@ -3610,77 +3658,102 @@ async function requireIdleNodes(commands) {
 }
 
 async function returnToOrigin() {
-  if (!state.connected || state.busy || state.disconnecting || !state.originReliable) return;
-  const commands = state.ledger.createReturnCommands();
-  if (!commands.length) return;
-  const overflow = moreThanFifoCapacity(commands);
-  if (overflow) {
-    toast(`节点 ${overflow[0]} 的返回动作需要 ${overflow[1]} 帧，超过 FIFO 容量`, "error");
-    return;
-  }
-  const preflightEpoch = state.operationEpoch;
-  if (!await requireIdleNodes(commands)) return;
-  const checkedCommands = state.ledger.createReturnCommands();
   if (
     !state.connected
-    || state.disconnecting
-    || state.operationEpoch !== preflightEpoch
-    || !state.originReliable
-    || !commandListsMatch(commands, checkedCommands)
-  ) {
-    toast("预检期间位置或 ID 已变化，请重新执行返回起点", "warning");
-    return;
-  }
-  const nodeTotal = new Set(commands.map(({ nodeId }) => nodeId)).size;
-  const confirmed = await confirmAction(
-    "全部返回起点",
-    `将向 ${nodeTotal} 个偏离起点的 CAN 节点发送 ${commands.length} 条反向补偿。重复 ID 已按物理节点合并净步数。`,
-    "返回起点",
-  );
-  const confirmedCommands = state.ledger.createReturnCommands();
-  if (
-    !confirmed
+    || state.connecting
     || state.busy
-    || !state.connected
+    || state.configIoBusy
     || state.disconnecting
-    || state.operationEpoch !== preflightEpoch
+    || state.originReturnPreparing
+    || state.originSetPreparing
     || !state.originReliable
-    || !commandListsMatch(commands, confirmedCommands)
   ) return;
-  const token = beginOperation("返回起点");
-  if (token == null) return;
-  const results = [];
-  const acceptedNodes = new Set();
-  for (const command of commands) {
-    if (token !== state.operationEpoch) break;
-    if (!await refreshClosedLoopReadinessIfStale([command])) break;
-    if (token !== state.operationEpoch) break;
-    const outcome = await transmit(command, "回起点", {
-      recordLedger: false,
-      render: false,
-      operationToken: token,
-    });
-    results.push(outcome.ok && !outcome.interrupted);
-    if (outcome.ok && !outcome.interrupted) acceptedNodes.add(command.nodeId);
-    if (!outcome.ok || outcome.interrupted) break;
-  }
-  while (results.length < commands.length) results.push(false);
-  if (token === state.operationEpoch) {
-    state.ledger.markReturnResults(commands, results);
-    state.pendingOriginNodes = acceptedNodes;
-  }
-  renderLogs();
-  refreshMotorRows();
+  state.originReturnPreparing = true;
   renderOrigin();
-  finishOperation(token);
-  if (token !== state.operationEpoch) return;
-  const returned = results.filter(Boolean).length;
-  toast(
-    returned === commands.length
-      ? "全部返回补偿已确认入队，正在等待电机执行完成"
-      : `已确认 ${returned} / ${commands.length} 条补偿，失败后已停止`,
-    returned === commands.length ? "info" : "warning",
-  );
+  try {
+    const commands = state.ledger.createReturnCommands();
+    if (!commands.length) return;
+    const overflow = moreThanFifoCapacity(commands);
+    if (overflow) {
+      toast(`节点 ${overflow[0]} 的返回动作需要 ${overflow[1]} 帧，超过 FIFO 容量`, "error");
+      return;
+    }
+    const preflightEpoch = state.operationEpoch;
+    const connectionEpoch = state.connectionEpoch;
+    const driverSessionEpoch = state.driverSessionEpoch;
+    const stateStillMatches = () => (
+      state.connected
+      && !state.connecting
+      && !state.disconnecting
+      && !state.busy
+      && !state.configIoBusy
+      && !state.originSetPreparing
+      && state.operationEpoch === preflightEpoch
+      && state.connectionEpoch === connectionEpoch
+      && state.driverSessionEpoch === driverSessionEpoch
+      && state.originReliable
+      && commandListsMatch(commands, state.ledger.createReturnCommands())
+    );
+    if (!await requireIdleNodes(commands) || !stateStillMatches()) {
+      toast("预检期间位置或 ID 已变化，请重新执行返回起点", "warning");
+      return;
+    }
+    const nodeTotal = new Set(commands.map(({ nodeId }) => nodeId)).size;
+    const confirmed = await confirmAction(
+      "恢复到本次连接起点",
+      `将按驱动板已确认接收的运动指令，向 ${nodeTotal} 个偏离起点的 CAN 节点发送 ${commands.length} 条反向补偿。重复 ID 已按物理节点合并净步数；这不是传感器绝对零点。`,
+      "恢复起点",
+    );
+    if (!confirmed) return;
+    if (!stateStillMatches()) {
+      toast("确认期间位置、连接或 ID 已变化，请重新执行返回起点", "warning");
+      return;
+    }
+    // The operator may leave the confirmation dialog open while another CAN
+    // controller starts a motor. Re-read A + D immediately before sending so
+    // the first idle snapshot can never authorize a later, stale compensation.
+    if (!await requireIdleNodes(commands) || !stateStillMatches()) {
+      toast("确认后节点状态已变化，本次未发送返回补偿", "warning");
+      return;
+    }
+    const token = beginOperation("返回起点");
+    if (token == null) return;
+    const results = [];
+    const acceptedNodes = new Set();
+    for (const command of commands) {
+      if (token !== state.operationEpoch) break;
+      if (!await refreshClosedLoopReadinessIfStale([command])) break;
+      if (token !== state.operationEpoch) break;
+      const outcome = await transmit(command, "回起点", {
+        recordLedger: false,
+        render: false,
+        operationToken: token,
+      });
+      results.push(outcome.ok && !outcome.interrupted);
+      if (outcome.ok && !outcome.interrupted) acceptedNodes.add(command.nodeId);
+      if (!outcome.ok || outcome.interrupted) break;
+    }
+    while (results.length < commands.length) results.push(false);
+    if (token === state.operationEpoch && state.originReliable) {
+      state.ledger.markReturnResults(commands, results);
+      state.pendingOriginNodes = acceptedNodes;
+    }
+    renderLogs();
+    refreshMotorRows();
+    renderOrigin();
+    finishOperation(token);
+    if (token !== state.operationEpoch) return;
+    const returned = results.filter(Boolean).length;
+    toast(
+      returned === commands.length
+        ? "全部返回补偿已确认入队，正在等待电机执行完成"
+        : `已确认 ${returned} / ${commands.length} 条补偿，失败后已停止`,
+      returned === commands.length ? "info" : "warning",
+    );
+  } finally {
+    state.originReturnPreparing = false;
+    renderOrigin();
+  }
 }
 
 function renderProgram() {
@@ -3801,22 +3874,59 @@ async function connectCan() {
   renderConnection();
   try {
     const nodeId = configuredNodeIds()[0] || 1;
-    await api.connect({ interface: interfaceName, simulate: state.simulate, nodeId });
+    const connection = await api.connect({ interface: interfaceName, simulate: state.simulate, nodeId });
+    if (!Number.isInteger(connection?.sessionEpoch)) {
+      throw new Error("桥接层没有返回 CAN 会话标识，无法安全建立起点");
+    }
     state.connectionEpoch += 1;
-    cancelMotionAckWaiters("CAN 会话已切换");
+    const connectionEpoch = state.connectionEpoch;
+    state.driverSessionEpoch = connection.sessionEpoch;
     state.connected = true;
     state.ledger.clear();
-    state.originReliable = true;
+    state.originReliable = false;
     state.pendingOriginNodes.clear();
     state.originCompletionMessage = "";
     state.nodeStatus.clear();
+    state.statusPolling = null;
     state.motionProfiles.clear();
     state.motionProfileLoading.clear();
     state.motionProfileErrors.clear();
     window.LumNamedActions.motionProfilesChanged();
-    addLog("success", "连接", `${state.simulate ? "仿真" : interfaceName} 已连接，当前位置作为本地参考起点`);
+    const originNodes = configuredNodeIds();
+    const originNodeSignature = nodeIdSignature(originNodes);
+    const originOperationEpoch = state.operationEpoch;
+    addLog(
+      "success",
+      "连接",
+      `${state.simulate ? "仿真" : interfaceName} 已连接${originNodes.length ? "，正在确认所有已配置节点的静止状态" : "，但尚未配置电机 ID"}`,
+    );
     persistState();
-    void pollStatuses();
+    renderConnection();
+    const originReady = originNodes.length > 0 && await requireIdleNodeIds(originNodes);
+    if (
+      state.connected
+      && !state.disconnecting
+      && !state.busy
+      && state.operationEpoch === originOperationEpoch
+      && state.connectionEpoch === connectionEpoch
+      && state.driverSessionEpoch === connection.sessionEpoch
+      && nodeIdSignature() === originNodeSignature
+    ) {
+      if (originReady) {
+        state.ledger.clear();
+        state.originReliable = true;
+        state.originCompletionMessage = `已确认 ${originNodes.length} 个物理节点静止，当前位置为本次连接起点`;
+        addLog("success", "起点", state.originCompletionMessage);
+      } else {
+        addLog(
+          "warning",
+          "起点",
+          originNodes.length
+            ? "连接起点未自动建立；请在确认机械安全并停止后手动设置起点"
+            : "未配置电机 ID，无法建立连接起点",
+        );
+      }
+    }
     refreshTimelineMotionProfiles();
     window.LumNamedActions.refreshMotionProfiles();
   } catch (error) {
@@ -3832,7 +3942,6 @@ async function disconnectCan() {
   if (!state.connected || state.disconnecting || state.busy) return;
   state.disconnecting = true;
   state.operationEpoch += 1;
-  cancelMotionAckWaiters("CAN 正在断开");
   renderConnection();
   try {
     await api.disconnect();
@@ -3843,6 +3952,8 @@ async function disconnectCan() {
   }
   state.connectionEpoch += 1;
   state.connected = false;
+  state.driverSessionEpoch = null;
+  state.statusPolling = null;
   state.nodeStatus.clear();
   invalidateOrigin("CAN 已断开");
   renderConnection();
@@ -3860,9 +3971,9 @@ async function stopMotor(motorId) {
     return;
   }
   const token = beginInterruptOperation(`停止 ${motorById(motorId).label}`);
+  invalidateOrigin(`节点 ${nodeId} 已请求立即停止，位置连续性不再可靠`);
   try {
     await api.stop({ nodeId, immediate: true, broadcast: false });
-    invalidateOrigin(`节点 ${nodeId} 已立即停止`);
     toast(`${motorById(motorId).label} 已立即停止；后续批量指令已取消`, "warning");
   } catch (error) {
     toast(errorMessage(error), "error");
@@ -3886,9 +3997,9 @@ async function disableMotor(motorId) {
   }
   if (state.timelineTest) await stopTimelineTest();
   const token = beginInterruptOperation(`失能 ${motorById(motorId).label}`);
+  invalidateOrigin(`节点 ${nodeId} 已请求失能，位置连续性不再可靠`);
   try {
     await api.disable({ nodeId, broadcast: false });
-    invalidateOrigin(`节点 ${nodeId} 已失能`);
     toast(`${motorById(motorId).label} 已失能；后续批量指令已取消`, "warning");
   } catch (error) {
     toast(errorMessage(error), "error");
@@ -3904,6 +4015,7 @@ async function emergencyStop() {
   state.timelineTest = null;
   const token = beginInterruptOperation("全总线急停");
   const connectionEpoch = state.connectionEpoch;
+  invalidateOrigin("已请求全总线急停，位置连续性不再可靠");
   addLog("warning", "急停", "已取消所有尚未发送的批量指令，正在广播 STOP + DISABLE");
   try {
     await api.stop({ immediate: true, broadcast: true });
@@ -3917,7 +4029,6 @@ async function emergencyStop() {
     addLog("error", "急停", `DISABLE 广播失败：${errorMessage(error)}`);
   }
   if (token !== state.operationEpoch || connectionEpoch !== state.connectionEpoch || !state.connected) return;
-  invalidateOrigin("已执行全总线急停");
   finishOperation(token);
   toast("全总线 STOP + DISABLE 已广播", "error");
 }
@@ -3925,11 +4036,19 @@ async function emergencyStop() {
 async function pollStatuses() {
   const timelineOwnsBusyState = Boolean(state.timelineRun || state.timelineTest);
   if (!state.connected || (state.busy && !timelineOwnsBusyState) || state.statusPolling) return;
-  state.statusPolling = true;
+  const pollToken = Object.freeze({
+    connectionEpoch: state.connectionEpoch,
+    driverSessionEpoch: state.driverSessionEpoch,
+  });
+  state.statusPolling = pollToken;
   try {
     const nodes = configuredNodeIds();
     for (let index = 0; index < nodes.length; index += 16) {
-      if (!state.connected) break;
+      if (
+        !state.connected
+        || state.connectionEpoch !== pollToken.connectionEpoch
+        || state.driverSessionEpoch !== pollToken.driverSessionEpoch
+      ) break;
       try {
         await api.statusMany(nodes.slice(index, index + 16), 0x09);
       } catch (_) {
@@ -3937,7 +4056,7 @@ async function pollStatuses() {
       }
     }
   } finally {
-    state.statusPolling = false;
+    if (state.statusPolling === pollToken) state.statusPolling = null;
   }
 }
 
@@ -3951,12 +4070,23 @@ function hasFault(faultFlags) {
 function handleDriverEvent(message) {
   const event = message?.event;
   const data = message?.data || {};
+  if ((event === "ack" || event === "status") && !driverEventIsCurrent(data)) return;
+  if (
+    event === "error"
+    && Number.isInteger(data.sessionEpoch)
+    && !driverEventIsCurrent(data)
+  ) return;
+  if (
+    event === "connection"
+    && data.connected === false
+    && state.connected
+    && !driverEventIsCurrent(data)
+  ) return;
   if (
     event === "ack"
     && Number.isInteger(data.nodeId)
     && (data.commandClass === 1 || data.commandClass === 2)
   ) {
-    receiveMotionAck(data);
     const runtime = state.nodeStatus.get(data.nodeId) || { nodeId: data.nodeId };
     runtime.lastMotionAckAt = Date.now();
     runtime.lastMotionAckSequence = data.sequence;
@@ -4005,10 +4135,11 @@ function handleDriverEvent(message) {
     state.timelineTest = null;
     state.operationEpoch += 1;
     state.connectionEpoch += 1;
-    cancelMotionAckWaiters("CAN 连接已中断");
     state.busy = false;
     state.activeOperation = "";
     state.connected = false;
+    state.driverSessionEpoch = null;
+    state.statusPolling = null;
     state.nodeStatus.clear();
     if (!state.disconnecting) {
       invalidateOrigin("CAN 连接异常中断");
@@ -4124,29 +4255,58 @@ function handleMotorBoardClick(event) {
 }
 
 async function setCurrentAsOrigin() {
-  if (!state.connected || state.busy || state.disconnecting) return;
-  const preflightEpoch = state.operationEpoch;
-  if (!await requireIdleNodeIds(configuredNodeIds())) return;
-  const confirmed = await confirmAction(
-    "重新设置本地起点",
-    "这不会移动电机，只会在确认所有已配置节点 FIFO 为空后，把当前物理位置定义为新的本地参考起点。",
-    "设为起点",
-  );
   if (
-    !confirmed
+    !state.connected
+    || state.connecting
     || state.busy
-    || !state.connected
+    || state.configIoBusy
     || state.disconnecting
-    || state.operationEpoch !== preflightEpoch
+    || state.originReturnPreparing
+    || state.originSetPreparing
   ) return;
-  state.ledger.clear();
-  state.originReliable = true;
-  state.pendingOriginNodes.clear();
-  state.originCompletionMessage = "当前位置已设为新的本地参考起点";
-  addLog("warning", "起点", state.originCompletionMessage);
-  refreshMotorRows();
+  const nodes = configuredNodeIds();
+  if (!nodes.length) {
+    toast("请先为至少一个电机配置 CAN ID", "warning");
+    return;
+  }
+  const preflightEpoch = state.operationEpoch;
+  const connectionEpoch = state.connectionEpoch;
+  const driverSessionEpoch = state.driverSessionEpoch;
+  const bindingSignature = nodeIdSignature(nodes);
+  const stateStillMatches = () => (
+    state.connected
+    && !state.connecting
+    && !state.disconnecting
+    && !state.busy
+    && !state.configIoBusy
+    && state.operationEpoch === preflightEpoch
+    && state.connectionEpoch === connectionEpoch
+    && state.driverSessionEpoch === driverSessionEpoch
+    && nodeIdSignature() === bindingSignature
+  );
+  state.originSetPreparing = true;
   renderOrigin();
-  toast("当前位置已设为本地参考起点");
+  try {
+    if (!await requireIdleNodeIds(nodes) || !stateStillMatches()) return;
+    const confirmed = await confirmAction(
+      "重新设置本地起点",
+      "这不会移动电机。确认后软件会再次读取所有已配置节点，并只在电机静止、无故障且 FIFO 为空时把当前位置定义为新的本地参考起点。",
+      "设为起点",
+    );
+    if (!confirmed || !stateStillMatches()) return;
+    if (!await requireIdleNodeIds(nodes) || !stateStillMatches()) return;
+    state.ledger.clear();
+    state.originReliable = true;
+    state.pendingOriginNodes.clear();
+    state.originCompletionMessage = "当前位置已设为新的本地参考起点";
+    addLog("warning", "起点", state.originCompletionMessage);
+    refreshMotorRows();
+    renderOrigin();
+    toast("当前位置已设为本地参考起点");
+  } finally {
+    state.originSetPreparing = false;
+    renderOrigin();
+  }
 }
 
 function updateTimelineDuration() {
@@ -4205,6 +4365,8 @@ function initEvents() {
   });
   $("clearLogButton").addEventListener("click", () => { state.logs = []; renderLogs(); });
   $("returnOriginButton").addEventListener("click", () => void returnToOrigin());
+  $("timelineReturnOriginButton").addEventListener("click", () => void returnToOrigin());
+  $("actionTimelineReturnOriginButton").addEventListener("click", () => void returnToOrigin());
   $("setOriginButton").addEventListener("click", () => void setCurrentAsOrigin());
   $("interfaceInput").addEventListener("change", () => { state.interfaceName = $("interfaceInput").value.trim(); persistState(); });
   $("simulateInput").addEventListener("change", () => { state.simulate = $("simulateInput").checked; persistState(); });

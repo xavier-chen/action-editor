@@ -112,21 +112,34 @@ class BridgeClient extends EventEmitter {
     });
     child.once("error", (error) => {
       if (this.process !== child) return;
+      const failedSessionEpoch = this.sessionEpoch;
       this.process = null;
       this.#advanceSession("bridge-error");
       this.#failAll(error);
       this.emit("event", {
         event: "connection",
-        data: { connected: false, reason: "bridge-error" },
+        data: {
+          connected: false,
+          reason: "bridge-error",
+          sessionEpoch: failedSessionEpoch,
+        },
       });
     });
     child.once("exit", (code, signal) => {
       if (this.process !== child) return;
       const detail = this.stderr.trim();
+      const failedSessionEpoch = this.sessionEpoch;
       this.process = null;
       this.#advanceSession("bridge-exit");
       this.#failAll(new Error(`CAN 桥接进程退出 code=${code} signal=${signal}${detail ? `: ${detail}` : ""}`));
-      this.emit("event", { event: "connection", data: { connected: false, reason: "bridge-exit" } });
+      this.emit("event", {
+        event: "connection",
+        data: {
+          connected: false,
+          reason: "bridge-exit",
+          sessionEpoch: failedSessionEpoch,
+        },
+      });
     });
   }
 

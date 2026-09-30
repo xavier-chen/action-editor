@@ -20,12 +20,15 @@ const CONFIG_EXPORT_CHANNEL = "motor-terminal:config-export";
 const CONFIG_IMPORT_CHANNEL = "motor-terminal:config-import";
 const TIMELINE_EXPORT_CHANNEL = "motor-terminal:timeline-export";
 const TIMELINE_IMPORT_CHANNEL = "motor-terminal:timeline-import";
+const ACTION_LIBRARY_EXPORT_CHANNEL = "motor-terminal:action-library-export";
+const ACTION_LIBRARY_IMPORT_CHANNEL = "motor-terminal:action-library-import";
 const ACTION_TIMELINE_EXPORT_CHANNEL = "motor-terminal:action-timeline-export";
 const ACTION_TIMELINE_IMPORT_CHANNEL = "motor-terminal:action-timeline-import";
 const DRIVER_EVENT = "driver:event";
 const RENDERER_FILE = path.join(__dirname, "renderer", "index.html");
 const MAX_STATUS_NODES = 16;
 const MAX_CONFIG_FILE_BYTES = 512 * 1024;
+const MAX_ACTION_LIBRARY_FILE_BYTES = 16 * 1024 * 1024;
 const MAX_ACTION_TIMELINE_FILE_BYTES = 16 * 1024 * 1024;
 const MOTION_PROFILE_PARAMETERS = Object.freeze({
   fullSteps: 0x10,
@@ -286,6 +289,22 @@ function actionTimelineText(value) {
   return value;
 }
 
+function actionLibraryText(value) {
+  if (typeof value !== "string") throw new TypeError("动作库必须是文本");
+  const size = Buffer.byteLength(value, "utf8");
+  if (size < 2 || size > MAX_ACTION_LIBRARY_FILE_BYTES) {
+    throw new RangeError("动作库文件必须小于 16 MiB");
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(value.replace(/^\uFEFF/, ""));
+  } catch (_) {
+    throw new TypeError("动作库文件必须是有效 JSON");
+  }
+  plainRecord(parsed, "动作库 JSON 根对象");
+  return value;
+}
+
 function assertJsonFilePath(filePath) {
   if (typeof filePath !== "string" || path.extname(filePath).toLowerCase() !== ".json") {
     throw new TypeError("配置文件必须使用 .json 扩展名");
@@ -321,6 +340,16 @@ function datedActionTimelineFileName() {
     String(now.getDate()).padStart(2, "0"),
   ].join("-");
   return `Action Editor-动作时间轴-${date}.json`;
+}
+
+function datedActionLibraryFileName() {
+  const now = new Date();
+  const date = [
+    now.getFullYear(),
+    String(now.getMonth() + 1).padStart(2, "0"),
+    String(now.getDate()).padStart(2, "0"),
+  ].join("-");
+  return `Action Editor-动作库-${date}.json`;
 }
 
 async function withConfigDialog(operation) {
@@ -403,10 +432,72 @@ async function importTimelineFile() {
   });
 }
 
+async function readBoundedTextFile(filePath, maximumBytes, label) {
+  let handle = null;
+  try {
+    handle = await fs.open(filePath, "r");
+    const info = await handle.stat();
+    if (!info.isFile() || info.size < 2 || info.size > maximumBytes) {
+      throw new RangeError(`${label}必须是普通文件，且不超过 ${Math.floor(maximumBytes / 1024 / 1024)} MiB`);
+    }
+    const chunks = [];
+    let totalBytes = 0;
+    while (totalBytes <= maximumBytes) {
+      const chunkSize = Math.min(64 * 1024, maximumBytes + 1 - totalBytes);
+      const buffer = Buffer.allocUnsafe(chunkSize);
+      const { bytesRead } = await handle.read(buffer, 0, chunkSize, null);
+      if (bytesRead === 0) break;
+      chunks.push(buffer.subarray(0, bytesRead));
+      totalBytes += bytesRead;
+    }
+    if (totalBytes < 2 || totalBytes > maximumBytes) {
+      throw new RangeError(`${label}必须为 2 字节以上且不超过 ${Math.floor(maximumBytes / 1024 / 1024)} MiB`);
+    }
+    return Buffer.concat(chunks, totalBytes).toString("utf8");
+  } finally {
+    if (handle) await handle.close().catch(() => {});
+  }
+}
+
+async function exportActionLibraryFile(content) {
+  const text = actionLibraryText(content);
+  return withConfigDialog(async () => {
+    const result = await dialog.showSaveDialog(mainWindow, {
+      title: "导出动作库",
+      defaultPath: path.join(app.getPath("documents"), datedActionLibraryFileName()),
+      filters: [{ name: "动作库 JSON", extensions: ["json"] }],
+      properties: ["showOverwriteConfirmation", "createDirectory"],
+    });
+    if (result.canceled || !result.filePath) return { canceled: true };
+    const filePath = assertJsonFilePath(result.filePath);
+    await writeTextFileAtomically(filePath, text);
+    return { canceled: false, fileName: path.basename(filePath) };
+  });
+}
+
+async function importActionLibraryFile() {
+  return withConfigDialog(async () => {
+    const result = await dialog.showOpenDialog(mainWindow, {
+      title: "导入动作库",
+      filters: [{ name: "动作库 JSON", extensions: ["json"] }],
+      properties: ["openFile"],
+    });
+    if (result.canceled || result.filePaths.length !== 1) return { canceled: true };
+    const filePath = assertJsonFilePath(result.filePaths[0]);
+    const content = await readBoundedTextFile(
+      filePath,
+      MAX_ACTION_LIBRARY_FILE_BYTES,
+      "动作库文件",
+    );
+    actionLibraryText(content);
+    return { canceled: false, fileName: path.basename(filePath), content };
+  });
+}
+
 async function writeTextFileAtomically(filePath, text) {
   const temporaryPath = path.join(
     path.dirname(filePath),
-    `.lummotor-action-timeline-${process.pid}-${Date.now()}.tmp`,
+    `.action-editor-json-${process.pid}-${Date.now()}.tmp`,
   );
   let handle = null;
   try {
@@ -448,11 +539,11 @@ async function importActionTimelineFile() {
     });
     if (result.canceled || result.filePaths.length !== 1) return { canceled: true };
     const filePath = assertJsonFilePath(result.filePaths[0]);
-    const info = await fs.stat(filePath);
-    if (!info.isFile() || info.size < 2 || info.size > MAX_ACTION_TIMELINE_FILE_BYTES) {
-      throw new RangeError("动作时间轴文件必须是小于 16 MiB 的普通文件");
-    }
-    const content = await fs.readFile(filePath, "utf8");
+    const content = await readBoundedTextFile(
+      filePath,
+      MAX_ACTION_TIMELINE_FILE_BYTES,
+      "动作时间轴文件",
+    );
     actionTimelineText(content);
     return { canceled: false, fileName: path.basename(filePath), content };
   });
@@ -631,6 +722,18 @@ ipcMain.handle(TIMELINE_IMPORT_CHANNEL, async (event) => {
   assertTrustedRenderer(event);
   assertOperational();
   return importTimelineFile();
+});
+
+ipcMain.handle(ACTION_LIBRARY_EXPORT_CHANNEL, async (event, content) => {
+  assertTrustedRenderer(event);
+  assertOperational();
+  return exportActionLibraryFile(content);
+});
+
+ipcMain.handle(ACTION_LIBRARY_IMPORT_CHANNEL, async (event) => {
+  assertTrustedRenderer(event);
+  assertOperational();
+  return importActionLibraryFile();
 });
 
 ipcMain.handle(ACTION_TIMELINE_EXPORT_CHANNEL, async (event, content) => {

@@ -6,6 +6,8 @@
   if (!actionModel) throw new Error("动作编辑器缺少命名动作模型");
   if (!motorRegistry) throw new Error("动作编辑器缺少电机注册表");
 
+  const ACTION_LIBRARY_FILE_FORMAT = "lummotor-action-library";
+  const ACTION_LIBRARY_FILE_SCHEMA_VERSION = 1;
   const ACTION_TIMELINE_FILE_FORMAT = "lummotor-action-timeline-project";
   const ACTION_TIMELINE_FILE_SCHEMA_VERSION = 1;
   const DEFAULT_DURATION_MS = 10_000;
@@ -42,6 +44,8 @@
   let snapMs = DEFAULT_SNAP_MS;
   let pixelsPerSecond = DEFAULT_PIXELS_PER_SECOND;
   let cursorMs = 0;
+  let actionTimelinePlaybackSettings = actionModel.validateActionPlaybackSettings({});
+  let actionTimelinePlaybackRevision = 0;
   let actionSearchQuery = "";
   let paletteDragDefinitionId = null;
   let paletteDragTrackId = null;
@@ -53,6 +57,95 @@
 
   function interactionLocked() {
     return state.busy || state.configIoBusy || state.connecting || state.disconnecting;
+  }
+
+  function formatPlaybackRate(rate) {
+    return `${Number(rate).toFixed(2)}×`;
+  }
+
+  function playbackParameterTargetLabel(target) {
+    if (target === "speed") return "速度等级";
+    if (target === "acceleration") return "加速度等级";
+    return "速度和加速度等级";
+  }
+
+  function actionTimelinePlaybackSummary(settings = actionTimelinePlaybackSettings) {
+    if (settings.mode === "time") {
+      return settings.rate === 1 ? "时间原速" : `时间 ${formatPlaybackRate(settings.rate)}`;
+    }
+    return `参数 ${formatPlaybackRate(settings.rate)} · ${playbackParameterTargetLabel(settings.parameterTarget)}`;
+  }
+
+  function actionTimelinePlaybackHint(settings = actionTimelinePlaybackSettings) {
+    if (settings.rate === 1) {
+      return settings.mode === "time"
+        ? `原速：预计播放 ${formatTimelineTime(durationMs)}；动作触发时间和电机参数均不改变`
+        : "参数 1.00×：动作时间与电机参数均不改变";
+    }
+    if (settings.mode === "time") {
+      const playbackDurationMs = actionModel.actionPlaybackDurationMs(durationMs, settings);
+      return `时间 ${formatPlaybackRate(settings.rate)}：原轴 ${formatTimelineTime(durationMs)} → 预计播放 ${formatTimelineTime(playbackDurationMs)}；电机参数不变`;
+    }
+    return `${playbackParameterTargetLabel(settings.parameterTarget)}临时 ×${settings.rate.toFixed(2)}，四舍五入并限制到 1–100；动作开始时刻不变`;
+  }
+
+  function renderActionTimelinePlaybackControls(locked = interactionLocked()) {
+    const settings = actionTimelinePlaybackSettings;
+    const rates = actionModel.ACTION_PLAYBACK_RATES;
+    const rateIndex = rates.indexOf(settings.rate);
+    const modeSelect = byId("actionTimelineRateModeSelect");
+    const rateSelect = byId("actionTimelineRateSelect");
+    const targetSelect = byId("actionTimelineRateTargetSelect");
+    const slowerButton = byId("actionTimelineSlowerButton");
+    const fasterButton = byId("actionTimelineFasterButton");
+    const hint = actionTimelinePlaybackHint(settings);
+    modeSelect.value = settings.mode;
+    rateSelect.value = String(settings.rate);
+    targetSelect.value = settings.parameterTarget;
+    modeSelect.disabled = locked;
+    rateSelect.disabled = locked;
+    targetSelect.disabled = locked || settings.mode !== "parameters";
+    slowerButton.disabled = locked || rateIndex <= 0;
+    fasterButton.disabled = locked || rateIndex < 0 || rateIndex >= rates.length - 1;
+    slowerButton.textContent = settings.mode === "time" ? "－ 慢放" : "－ 降低";
+    fasterButton.textContent = settings.mode === "time" ? "＋ 快放" : "＋ 提升";
+    targetSelect.title = settings.mode === "parameters"
+      ? "选择本次播放要缩放的电机控制等级"
+      : "仅电机参数倍率模式可选择调整对象";
+    byId("actionTimelinePlaybackOptions").dataset.mode = settings.mode;
+    byId("actionTimelineRateHint").textContent = hint;
+    byId("actionTimelineRateHint").title = hint;
+    byId("actionTimelinePlayButton").title = `从时间轴起点播放 · ${actionTimelinePlaybackSummary(settings)}`;
+  }
+
+  function updateActionTimelinePlaybackSettings(patch) {
+    if (interactionLocked()) return;
+    try {
+      const next = actionModel.validateActionPlaybackSettings({
+        ...actionTimelinePlaybackSettings,
+        ...patch,
+      });
+      if (
+        next.mode !== actionTimelinePlaybackSettings.mode
+        || next.rate !== actionTimelinePlaybackSettings.rate
+        || next.parameterTarget !== actionTimelinePlaybackSettings.parameterTarget
+      ) {
+        actionTimelinePlaybackSettings = next;
+        actionTimelinePlaybackRevision += 1;
+      }
+      renderActionTimelineControls();
+    } catch (error) {
+      toast(errorMessage(error), "error");
+      renderActionTimelinePlaybackControls();
+    }
+  }
+
+  function stepActionTimelinePlaybackRate(direction) {
+    const rates = actionModel.ACTION_PLAYBACK_RATES;
+    const currentIndex = rates.indexOf(actionTimelinePlaybackSettings.rate);
+    if (currentIndex < 0) return;
+    const nextIndex = Math.min(rates.length - 1, Math.max(0, currentIndex + direction));
+    if (nextIndex !== currentIndex) updateActionTimelinePlaybackSettings({ rate: rates[nextIndex] });
   }
 
   function actionTimelineFileStableId(value, label) {
@@ -1204,9 +1297,10 @@
   function actionTimelineStatusText(analysis = actionTimelineAnalysis()) {
     const run = state.timelineRun;
     if (run?.surface === "actionTimeline") {
+      const playback = run.playbackSummary ? ` · ${run.playbackSummary}` : "";
       return run.phase === "draining"
-        ? "动作均已发送，正在等待相关电机 FIFO 清空"
-        : `正在按时间播放 · ${run.sentCount} / ${run.actionCount} 个电机运动已触发`;
+        ? `动作均已发送${playback} · 正在等待相关电机 FIFO 清空`
+        : `正在播放${playback} · ${run.sentCount} / ${run.actionCount} 个电机运动已触发`;
     }
     if (!library.size) return "请先在“动作编辑”中创建并保存动作";
     if (!sequence.size) return "从左侧动作素材点击＋，或直接拖到时间轴的指定位置";
@@ -1338,11 +1432,15 @@
     byId("actionTimelineSaveProjectButton").disabled = locked;
     byId("actionTimelineImportProjectButton").disabled = locked;
     byId("actionTimelineExportProjectButton").disabled = locked;
+    byId("actionTimelineExportProjectButton").title = draftIsDirty()
+      ? "请先到动作编辑页面保存当前修改；未保存草稿不会写入导出文件"
+      : "导出包含动作库、轨道和实例的完整时间轴 JSON 文件";
     byId("actionTimelineAddTrackButton").disabled = locked
       || actionTracks.size >= actionModel.MAX_ACTION_TRACKS;
     byId("actionTimelineDurationInput").value = String(durationMs / 1_000);
     byId("actionTimelineSnapSelect").value = String(snapMs);
     byId("actionTimelineZoomInput").value = String(pixelsPerSecond);
+    renderActionTimelinePlaybackControls(locked);
     byId("actionTimelineTrackCount").textContent = String(actionTracks.size);
     byId("actionTimelinePlacementCount").textContent = String(sequence.size);
     for (const input of document.querySelectorAll(".action-track-name-input")) {
@@ -1383,6 +1481,11 @@
     const locked = interactionLocked();
     const draftHasConflicts = expandedConflicts(expandedPlanFromMotions(draftMotions)).length > 0;
     byId("namedActionNewButton").disabled = locked;
+    byId("namedActionImportLibraryButton").disabled = locked;
+    byId("namedActionExportLibraryButton").disabled = locked || !library.size;
+    byId("namedActionExportLibraryButton").title = draftIsDirty()
+      ? "请先保存当前动作；未保存修改不会写入导出文件"
+      : "将全部已保存动作导出为独立 JSON 文件";
     byId("namedActionNameInput").disabled = locked;
     byId("namedActionSaveButton").disabled = locked
       || !draftName.trim()
@@ -1940,6 +2043,14 @@
     }));
   }
 
+  function expandedPlanForActionPlayback(expanded, settings) {
+    return expanded.map((entry) => ({
+      ...entry,
+      motion: actionModel.motionForActionPlayback(entry.motion, settings),
+      startMs: actionModel.actionPlaybackStartMs(entry.startMs, settings),
+    }));
+  }
+
   function groupsFromExpanded(expanded) {
     const groups = [];
     for (const entry of [...expanded].sort((left, right) => left.startMs - right.startMs)) {
@@ -1951,7 +2062,7 @@
     return groups;
   }
 
-  function validateExpandedPlan(expanded) {
+  function validateExpandedPlan(expanded, maximumStartMs = actionModel.MAX_START_MS) {
     if (!expanded.length) throw new Error("动作中还没有电机运动");
     if (expanded.length > MAX_EXPANDED_MOTIONS) {
       throw new RangeError(`一次最多展开 ${MAX_EXPANDED_MOTIONS} 个电机运动`);
@@ -1960,8 +2071,10 @@
     if (stale) {
       throw new Error(`${motorById(stale.motion.motorId)?.label || stale.motion.motorId} 保存的 ID ${stale.motion.nodeId} 与当前绑定不一致`);
     }
-    const overflow = expanded.find(({ startMs }) => startMs > actionModel.MAX_START_MS);
-    if (overflow) throw new RangeError("动作展开后的发送时间超过 10:00");
+    const overflow = expanded.find(({ startMs }) => startMs > maximumStartMs);
+    if (overflow) {
+      throw new RangeError(`动作展开后的发送时间超过 ${formatTimelineTime(maximumStartMs)}`);
+    }
     const conflicts = expandedConflicts(expanded);
     if (conflicts.length) {
       const [{ startMs, motion }] = conflicts[0];
@@ -1973,12 +2086,23 @@
     if (!state.connected || interactionLocked()) return;
     try {
       validateExpandedPlan(expanded);
-      const groups = groupsFromExpanded(expanded);
+      const playbackSettings = options.surface === "actionTimeline"
+        ? actionModel.validateActionPlaybackSettings(options.playbackSettings)
+        : null;
+      const effectiveExpanded = playbackSettings
+        ? expandedPlanForActionPlayback(expanded, playbackSettings)
+        : expanded;
+      const maximumEffectiveStartMs = playbackSettings
+        ? actionModel.actionPlaybackStartMs(actionModel.MAX_START_MS, playbackSettings)
+        : actionModel.MAX_START_MS;
+      validateExpandedPlan(effectiveExpanded, maximumEffectiveStartMs);
+      const groups = groupsFromExpanded(effectiveExpanded);
       const commands = groups.flatMap(({ items }) => items.map(({ command }) => command));
       const operationEpoch = state.operationEpoch;
       const connectionEpoch = state.connectionEpoch;
       const libraryRevision = library.revision;
       const sequenceRevision = sequence.revision;
+      const playbackRevision = actionTimelinePlaybackRevision;
       const draftSignature = options.surface === "namedAction" ? JSON.stringify(draftMotions) : null;
       if (!await requireIdleNodes(commands)) return;
       if (
@@ -1990,19 +2114,38 @@
         || state.connectionEpoch !== connectionEpoch
         || library.revision !== libraryRevision
         || (options.surface === "actionTimeline" && sequence.revision !== sequenceRevision)
+        || (options.surface === "actionTimeline" && playbackRevision !== options.playbackRevision)
+        || (options.surface === "actionTimeline" && actionTimelinePlaybackRevision !== playbackRevision)
         || (options.surface === "namedAction" && JSON.stringify(draftMotions) !== draftSignature)
       ) {
-        toast("预检期间动作、ID 或连接状态已变化，本次未播放", "warning");
+        toast("预检期间动作、播放设置、ID 或连接状态已变化，本次未播放", "warning");
         return;
       }
       validateExpandedPlan(expanded);
+      validateExpandedPlan(effectiveExpanded, maximumEffectiveStartMs);
+      const sourceDurationMs = options.durationMs;
+      const playbackDurationMs = playbackSettings
+        ? actionModel.actionPlaybackDurationMs(sourceDurationMs, playbackSettings)
+        : sourceDurationMs;
+      const playbackSummary = playbackSettings
+        ? actionTimelinePlaybackSummary(playbackSettings)
+        : "";
+      const playbackLogDetail = playbackSettings?.mode === "time"
+        ? `${playbackSummary} · 原轴 ${formatTimelineTime(sourceDurationMs)} / 播放 ${formatTimelineTime(playbackDurationMs)} · 电机参数不变`
+        : playbackSettings
+          ? `${playbackSummary} · 动作开始时刻不变 · 等级限制 1–100`
+          : "";
       launchNamedTimelineRun({
         surface: options.surface,
         sourceLabel: options.sourceLabel,
         completionLabel: options.completionLabel,
         operationLabel: options.operationLabel,
         groups,
-        durationMs: options.durationMs,
+        durationMs: playbackDurationMs,
+        sourceDurationMs,
+        cursorTimeScale: playbackSettings?.mode === "time" ? playbackSettings.rate : 1,
+        playbackSummary,
+        playbackLogDetail,
         placementCount: options.placementCount,
         definitionCount: options.definitionCount,
       });
@@ -2057,9 +2200,247 @@
       completionLabel: "动作时间轴播放完成",
       operationLabel: "动作时间轴播放",
       durationMs,
+      playbackSettings: actionTimelinePlaybackSettings,
+      playbackRevision: actionTimelinePlaybackRevision,
       placementCount: placements.length,
       definitionCount: new Set(placements.map(({ actionDefinitionId }) => actionDefinitionId)).size,
     });
+  }
+
+  function actionLibraryMotorSnapshot(definitions = library.snapshot()) {
+    const referencedMotorIds = new Set(definitions.flatMap((definition) => (
+      definition.motions.map(({ motorId }) => motorId)
+    )));
+    const motors = state.motors
+      .filter(({ id }) => referencedMotorIds.has(id))
+      .map(({ id, label }) => ({ motorId: id, label }));
+    if (motors.length !== referencedMotorIds.size) {
+      throw new RangeError("动作库包含当前电机配置中不存在的位置，无法导出");
+    }
+    return motors;
+  }
+
+  function exportActionLibraryDocument() {
+    const definitions = library.snapshot();
+    if (!definitions.length) throw new RangeError("动作库中还没有已保存动作");
+    const motors = actionLibraryMotorSnapshot(definitions);
+    return {
+      format: ACTION_LIBRARY_FILE_FORMAT,
+      schemaVersion: ACTION_LIBRARY_FILE_SCHEMA_VERSION,
+      exportedAt: new Date().toISOString(),
+      motorCount: motors.length,
+      motors,
+      namedActions: {
+        schemaVersion: 1,
+        definitions,
+      },
+    };
+  }
+
+  async function exportActionLibraryProject() {
+    if (interactionLocked()) return;
+    if (draftIsDirty()) {
+      toast("当前动作还有未保存修改，请先保存动作再导出动作库", "warning");
+      return;
+    }
+    if (!library.size) {
+      toast("动作库中还没有可导出的已保存动作", "warning");
+      return;
+    }
+    state.configIoBusy = true;
+    renderConnection();
+    try {
+      const content = `${JSON.stringify(exportActionLibraryDocument(), null, 2)}\n`;
+      const result = await api.exportActionLibraryFile(content);
+      if (!result?.canceled) {
+        toast(`动作库已导出：${result.fileName || "JSON 文件"} · ${library.size} 个动作`);
+      }
+    } catch (error) {
+      toast(`动作库导出失败：${errorMessage(error)}`, "error");
+    } finally {
+      state.configIoBusy = false;
+      renderConnection();
+    }
+  }
+
+  function normalizeImportedActionLibrary(content) {
+    if (typeof content !== "string") throw new TypeError("动作库文件内容不合法");
+    let parsed;
+    try {
+      parsed = JSON.parse(content.replace(/^\uFEFF/, ""));
+    } catch (_) {
+      throw new TypeError("动作库文件不是有效 JSON");
+    }
+    const documentRecord = configurationRecord(parsed, "动作库文件");
+    configurationOnlyKeys(
+      documentRecord,
+      ["format", "schemaVersion", "exportedAt", "motorCount", "motors", "namedActions"],
+      "动作库文件",
+    );
+    if (documentRecord.format !== ACTION_LIBRARY_FILE_FORMAT) {
+      throw new TypeError("不是 Action Editor 导出的动作库文件");
+    }
+    if (documentRecord.schemaVersion !== ACTION_LIBRARY_FILE_SCHEMA_VERSION) {
+      throw new RangeError(`不支持的动作库文件版本: ${documentRecord.schemaVersion}`);
+    }
+    configurationExportedAt(documentRecord.exportedAt, "动作库文件");
+    const motorCount = configurationInteger(
+      documentRecord.motorCount,
+      "动作库电机引用数量",
+      0,
+      motorRegistry.MAX_MOTORS,
+    );
+    if (!Array.isArray(documentRecord.motors)) throw new TypeError("动作库缺少电机引用快照");
+    if (documentRecord.motors.length !== motorCount) {
+      throw new RangeError("动作库电机引用数量不匹配");
+    }
+    const importedMotors = motorRegistry.normalizeMotorCatalog(documentRecord.motors.map(
+      (rawMotor, index) => {
+        const motor = configurationRecord(rawMotor, `第 ${index + 1} 个动作库电机引用`);
+        configurationOnlyKeys(motor, ["motorId", "label"], `第 ${index + 1} 个动作库电机引用`);
+        return {
+          id: motorRegistry.normalizeMotorId(motor.motorId),
+          label: motorRegistry.normalizeMotorLabel(motor.label),
+          group: motorRegistry.CUSTOM_GROUP_ID,
+        };
+      },
+    ));
+    const importedMotorIds = new Set(importedMotors.map(({ id }) => id));
+    const importedMotorLabels = new Map(importedMotors.map(({ id, label }) => [id, label]));
+
+    const namedActions = configurationRecord(documentRecord.namedActions, "命名动作库");
+    configurationOnlyKeys(namedActions, ["schemaVersion", "definitions"], "命名动作库");
+    if (namedActions.schemaVersion !== 1) {
+      throw new RangeError(`不支持的命名动作库版本: ${namedActions.schemaVersion}`);
+    }
+    if (!Array.isArray(namedActions.definitions) || namedActions.definitions.length < 1) {
+      throw new TypeError("动作库文件必须包含至少一个命名动作");
+    }
+    if (namedActions.definitions.length > actionModel.MAX_ACTION_DEFINITIONS) {
+      throw new RangeError(`最多可以导入 ${actionModel.MAX_ACTION_DEFINITIONS} 个命名动作`);
+    }
+    for (const [definitionIndex, rawDefinition] of namedActions.definitions.entries()) {
+      const definition = configurationRecord(rawDefinition, `第 ${definitionIndex + 1} 个命名动作`);
+      configurationOnlyKeys(
+        definition,
+        ["actionDefinitionId", "name", "motions"],
+        `第 ${definitionIndex + 1} 个命名动作`,
+      );
+      actionTimelineFileStableId(definition.actionDefinitionId, "actionDefinitionId");
+      if (!Array.isArray(definition.motions)) throw new TypeError("命名动作的电机运动必须是数组");
+      for (const [motionIndex, rawMotion] of definition.motions.entries()) {
+        const motion = configurationRecord(
+          rawMotion,
+          `第 ${definitionIndex + 1} 个命名动作的第 ${motionIndex + 1} 个电机运动`,
+        );
+        configurationOnlyKeys(
+          motion,
+          ["motionId", "motorId", "nodeId", "startMs", "signedSteps", "speed", "acceleration", "closed"],
+          `第 ${definitionIndex + 1} 个命名动作的第 ${motionIndex + 1} 个电机运动`,
+        );
+        actionTimelineFileStableId(motion.motionId, "motionId");
+        if (typeof motion.closed !== "boolean") throw new TypeError("电机运动的闭环模式必须是布尔值");
+        actionModel.validateActionFileMotion(motion);
+      }
+    }
+    const importedLibrary = new actionModel.ActionLibrary(namedActions.definitions);
+    for (const definition of importedLibrary.snapshot()) {
+      for (const motion of definition.motions) {
+        if (!importedMotorIds.has(motion.motorId)) {
+          throw new RangeError(`动作“${definition.name}”引用了文件中不存在的电机位置: ${motion.motorId}`);
+        }
+        if (!hasMotor(motion.motorId)) {
+          throw new RangeError(`当前电机配置缺少动作引用的位置: ${motion.motorId}`);
+        }
+        const currentMotor = motorById(motion.motorId);
+        const importedLabel = importedMotorLabels.get(motion.motorId);
+        if (currentMotor.label !== importedLabel) {
+          throw new RangeError(
+            `电机位置 ${motion.motorId} 的名称不一致：文件为“${importedLabel}”，当前为“${currentMotor.label}”`,
+          );
+        }
+      }
+    }
+    return importedLibrary;
+  }
+
+  async function importActionLibraryProject() {
+    if (interactionLocked()) return;
+    const operationEpoch = state.operationEpoch;
+    const connectionEpoch = state.connectionEpoch;
+    const libraryRevision = library.revision;
+    const tracksRevision = actionTracks.revision;
+    const sequenceRevision = sequence.revision;
+    let committed = false;
+    state.configIoBusy = true;
+    cancelInteractions();
+    renderConnection();
+    try {
+      const result = await api.importActionLibraryFile();
+      if (result?.canceled) return;
+      if (
+        state.busy
+        || state.connecting
+        || state.disconnecting
+        || state.operationEpoch !== operationEpoch
+        || state.connectionEpoch !== connectionEpoch
+        || library.revision !== libraryRevision
+        || actionTracks.revision !== tracksRevision
+        || sequence.revision !== sequenceRevision
+      ) {
+        throw new Error("导入期间运行状态已变化，未追加动作库");
+      }
+      const importedLibrary = normalizeImportedActionLibrary(result?.content);
+      const mergeResult = library.appendAsNew(importedLibrary.snapshot());
+      committed = mergeResult.added.length > 0;
+      definitionDurationCache = new WeakMap();
+
+      if (!selectedTimelineDefinitionId && mergeResult.added.length) {
+        selectedTimelineDefinitionId = mergeResult.added[0].actionDefinitionId;
+      }
+      if (!draftIsDirty() && !draftDefinitionId && mergeResult.added.length) {
+        const firstAdded = mergeResult.added[0];
+        selectedDefinitionId = firstAdded.actionDefinitionId;
+        draftDefinitionId = firstAdded.actionDefinitionId;
+        draftName = firstAdded.name;
+        draftMotions = cloneMotions(firstAdded.motions);
+        resetNamedMotionTimeline();
+        selectedDraftMotionIndex = null;
+        byId("namedActionNameInput").value = draftName;
+        resetMotionEditor();
+      }
+
+      const saved = committed ? persistState(true) : true;
+      renderActionEditor();
+      renderActionTimeline();
+      if (state.connected && committed) refreshMotionProfiles();
+      const staleMotions = mergeResult.added.flatMap((definition) => (
+        definition.motions.filter((motion) => !motionBindingCurrent(motion))
+      ));
+      const summary = [
+        `${mergeResult.added.length} 个动作已追加`,
+        mergeResult.skipped ? `${mergeResult.skipped} 个同名同内容动作已跳过` : "",
+      ].filter(Boolean).join(" · ");
+      const importedMessage = saved
+        ? `动作库导入完成：${result.fileName || "JSON 文件"} · ${summary}`
+        : `动作库已追加，但本机保存失败 · ${summary}`;
+      toast(
+        staleMotions.length
+          ? `${importedMessage}；${staleMotions.length} 个电机运动的节点 ID 与当前绑定不一致，已标记失效`
+          : importedMessage,
+        staleMotions.length || !saved ? "warning" : "info",
+      );
+    } catch (error) {
+      toast(
+        committed
+          ? `动作库已经追加，但界面刷新失败：${errorMessage(error)}`
+          : `动作库导入失败：${errorMessage(error)}；未修改现有动作和时间轴`,
+        "error",
+      );
+    } finally {
+      state.configIoBusy = false;
+      renderConnection();
+    }
   }
 
   function saveActionTimelineProject() {
@@ -2103,6 +2484,10 @@
 
   async function exportActionTimelineProject() {
     if (interactionLocked()) return;
+    if (draftIsDirty()) {
+      toast("当前动作还有未保存修改，请先保存动作再导出时间轴", "warning");
+      return;
+    }
     state.configIoBusy = true;
     renderConnection();
     try {
@@ -2162,6 +2547,7 @@
       },
     ));
     const importedMotorIds = new Set(importedMotors.map(({ id }) => id));
+    const importedMotorLabels = new Map(importedMotors.map(({ id, label }) => [id, label]));
 
     const namedActions = configurationRecord(documentRecord.namedActions, "命名动作库");
     configurationOnlyKeys(namedActions, ["schemaVersion", "definitions"], "命名动作库");
@@ -2193,6 +2579,7 @@
         );
         actionTimelineFileStableId(motion.motionId, "motionId");
         if (typeof motion.closed !== "boolean") throw new TypeError("电机运动的闭环模式必须是布尔值");
+        actionModel.validateActionFileMotion(motion);
       }
     }
     const importedLibrary = new actionModel.ActionLibrary(namedActions.definitions);
@@ -2245,6 +2632,7 @@
       actionTimelineFileStableId(placement.placementId, "placementId");
       actionTimelineFileStableId(placement.actionDefinitionId, "actionDefinitionId");
       actionTimelineFileStableId(placement.trackId, "trackId");
+      configurationInteger(placement.startMs, "动作实例开始时间", 0, actionModel.MAX_START_MS);
     }
     const importedSequence = new actionModel.NamedActionTimeline(timeline.placements);
 
@@ -2255,6 +2643,13 @@
         }
         if (!hasMotor(motion.motorId)) {
           throw new RangeError(`当前电机配置缺少动作引用的位置: ${motion.motorId}`);
+        }
+        const currentMotor = motorById(motion.motorId);
+        const importedLabel = importedMotorLabels.get(motion.motorId);
+        if (currentMotor.label !== importedLabel) {
+          throw new RangeError(
+            `电机位置 ${motion.motorId} 的名称不一致：文件为“${importedLabel}”，当前为“${currentMotor.label}”`,
+          );
         }
       }
     }
@@ -2422,7 +2817,11 @@
 
   function updatePlaybackCursor(run, elapsed) {
     if (run.surface === "actionTimeline") {
-      cursorMs = Math.min(run.durationMs, Math.round(elapsed));
+      const sourceDurationMs = run.sourceDurationMs || run.durationMs;
+      const cursorTimeScale = Number.isFinite(run.cursorTimeScale) && run.cursorTimeScale > 0
+        ? run.cursorTimeScale
+        : 1;
+      cursorMs = Math.min(sourceDurationMs, Math.round(elapsed * cursorTimeScale));
       renderActionTimelineCursor();
       followActionTimelineCursor();
     } else if (run.surface === "namedAction") {
@@ -2441,7 +2840,7 @@
   }
 
   function finishPlayback(run) {
-    if (run.surface === "actionTimeline") cursorMs = run.durationMs;
+    if (run.surface === "actionTimeline") cursorMs = run.sourceDurationMs || run.durationMs;
     if (run.surface === "namedAction") namedMotionCursorMs = run.durationMs;
   }
 
@@ -2719,6 +3118,8 @@
 
   function initEvents() {
     byId("namedActionNewButton").addEventListener("click", () => void startNewDefinition());
+    byId("namedActionImportLibraryButton").addEventListener("click", () => void importActionLibraryProject());
+    byId("namedActionExportLibraryButton").addEventListener("click", () => void exportActionLibraryProject());
     byId("namedActionNameInput").addEventListener("input", (event) => {
       draftName = event.target.value;
       renderDefinitionForm();
@@ -2787,6 +3188,21 @@
     byId("actionTimelineExportProjectButton").addEventListener("click", () => void exportActionTimelineProject());
     byId("actionTimelinePlayButton").addEventListener("click", () => void playActionTimeline());
     byId("actionTimelineStopButton").addEventListener("click", () => void stopTimelinePlayback("用户停止动作时间轴播放"));
+    byId("actionTimelineRateModeSelect").addEventListener("change", (event) => {
+      updateActionTimelinePlaybackSettings({ mode: event.target.value });
+    });
+    byId("actionTimelineRateSelect").addEventListener("change", (event) => {
+      updateActionTimelinePlaybackSettings({ rate: Number(event.target.value) });
+    });
+    byId("actionTimelineRateTargetSelect").addEventListener("change", (event) => {
+      updateActionTimelinePlaybackSettings({ parameterTarget: event.target.value });
+    });
+    byId("actionTimelineSlowerButton").addEventListener("click", () => {
+      stepActionTimelinePlaybackRate(-1);
+    });
+    byId("actionTimelineFasterButton").addEventListener("click", () => {
+      stepActionTimelinePlaybackRate(1);
+    });
     byId("actionTimelineDeleteButton").addEventListener("click", deleteSelectedPlacement);
     byId("actionTimelineClearButton").addEventListener("click", clearActionTimeline);
     byId("actionTimelineDurationInput").addEventListener("change", updateActionTimelineDuration);

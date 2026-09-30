@@ -18,6 +18,7 @@
   const MAX_ACTION_TRACK_NAME_LENGTH = 24;
   const MAX_START_MS = 10 * 60 * 1_000;
   const MAX_STEP_COUNT = 0xFFFFFF;
+  const ACTION_PLAYBACK_RATES = Object.freeze([0.25, 0.5, 0.75, 1, 1.25, 1.5, 2]);
 
   function plainRecord(value, label) {
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -93,6 +94,61 @@
     return value;
   }
 
+  function actionPlaybackRate(value) {
+    if (value === null || value === "" || typeof value === "boolean") {
+      throw new TypeError("动作播放倍率必须是受支持的数值");
+    }
+    const rate = Number(value);
+    if (!ACTION_PLAYBACK_RATES.includes(rate)) {
+      throw new RangeError(`动作播放倍率必须为 ${ACTION_PLAYBACK_RATES.join("、")}`);
+    }
+    return rate;
+  }
+
+  function validateActionPlaybackSettings(input = {}) {
+    const record = plainRecord(input, "动作播放设置");
+    onlyKeys(
+      record,
+      new Set(["mode", "rate", "parameterTarget"]),
+      "动作播放设置",
+    );
+    const mode = record.mode === undefined ? "time" : record.mode;
+    if (mode !== "time" && mode !== "parameters") {
+      throw new RangeError("动作播放模式必须为 time 或 parameters");
+    }
+    const parameterTarget = record.parameterTarget === undefined
+      ? "both"
+      : record.parameterTarget;
+    if (!["speed", "acceleration", "both"].includes(parameterTarget)) {
+      throw new RangeError("动作播放参数目标必须为 speed、acceleration 或 both");
+    }
+    return Object.freeze({
+      mode,
+      rate: actionPlaybackRate(record.rate === undefined ? 1 : record.rate),
+      parameterTarget,
+    });
+  }
+
+  function actionPlaybackStartMs(startMs, settings) {
+    const normalizedStartMs = integer(startMs, "开始时间", 0, MAX_START_MS);
+    const normalizedSettings = validateActionPlaybackSettings(settings);
+    return normalizedSettings.mode === "time"
+      ? Math.round(normalizedStartMs / normalizedSettings.rate)
+      : normalizedStartMs;
+  }
+
+  function actionPlaybackDurationMs(durationMs, settings) {
+    const normalizedDurationMs = integer(durationMs, "动作时长", 1, MAX_START_MS);
+    const normalizedSettings = validateActionPlaybackSettings(settings);
+    return normalizedSettings.mode === "time"
+      ? Math.max(1, Math.ceil(normalizedDurationMs / normalizedSettings.rate))
+      : normalizedDurationMs;
+  }
+
+  function actionPlaybackLevel(level, rate) {
+    return Math.min(100, Math.max(1, Math.round(level * rate)));
+  }
+
   function freezeArray(items) {
     return Object.freeze(items.slice());
   }
@@ -124,6 +180,53 @@
       speed: integer(record.speed, "速度", 1, 100),
       acceleration: integer(record.acceleration, "加速度", 1, 100),
       closed: closedValue(record.closed),
+    });
+  }
+
+  function validateActionFileMotion(input) {
+    const record = plainRecord(input, "动作文件中的运动片段");
+    for (const [field, label, minimum, maximum] of [
+      ["nodeId", "电机 ID", 1, 127],
+      ["startMs", "开始时间", 0, MAX_START_MS],
+      ["speed", "速度", 1, 100],
+      ["acceleration", "加速度", 1, 100],
+    ]) {
+      if (!Number.isSafeInteger(record[field])) {
+        throw new TypeError(`${label}必须是 JSON 整数`);
+      }
+      if (record[field] < minimum || record[field] > maximum) {
+        throw new RangeError(`${label}必须为 ${minimum}–${maximum}`);
+      }
+    }
+    if (!Number.isSafeInteger(record.signedSteps)) {
+      throw new TypeError("步数必须是 JSON 整数");
+    }
+    if (record.signedSteps === 0 || Math.abs(record.signedSteps) > MAX_STEP_COUNT) {
+      throw new RangeError(`步数绝对值必须为 1–${MAX_STEP_COUNT}`);
+    }
+    if (typeof record.closed !== "boolean") {
+      throw new TypeError("动作文件中的闭环模式必须是布尔值");
+    }
+    return validateMotion(record);
+  }
+
+  function motionForActionPlayback(input, settings) {
+    const motion = validateMotion(input);
+    const normalizedSettings = validateActionPlaybackSettings(settings);
+    if (normalizedSettings.mode !== "parameters") return motion;
+
+    const scaleSpeed = normalizedSettings.parameterTarget === "speed"
+      || normalizedSettings.parameterTarget === "both";
+    const scaleAcceleration = normalizedSettings.parameterTarget === "acceleration"
+      || normalizedSettings.parameterTarget === "both";
+    return Object.freeze({
+      ...motion,
+      speed: scaleSpeed
+        ? actionPlaybackLevel(motion.speed, normalizedSettings.rate)
+        : motion.speed,
+      acceleration: scaleAcceleration
+        ? actionPlaybackLevel(motion.acceleration, normalizedSettings.rate)
+        : motion.acceleration,
     });
   }
 
@@ -285,6 +388,21 @@
     });
   }
 
+  function definitionContentSignature(definition) {
+    return JSON.stringify({
+      name: definition.name,
+      motions: definition.motions.map((motion) => ({
+        motorId: motion.motorId,
+        nodeId: motion.nodeId,
+        startMs: motion.startMs,
+        signedSteps: motion.signedSteps,
+        speed: motion.speed,
+        acceleration: motion.acceleration,
+        closed: motion.closed,
+      })),
+    });
+  }
+
   class ActionLibrary {
     constructor(definitions = []) {
       this._definitions = [];
@@ -438,6 +556,67 @@
       this._commitContext(context);
       this._revision += 1;
       return this.snapshot();
+    }
+
+    appendAsNew(definitions) {
+      if (!Array.isArray(definitions)) throw new TypeError("命名动作必须是数组");
+      const validated = definitions.map(validateActionDefinition);
+      const existingByName = new Map(this._definitions.map((definition) => (
+        [definition.name, definition]
+      )));
+      const incomingNames = new Set();
+      const pending = [];
+      let skipped = 0;
+
+      for (const definition of validated) {
+        if (incomingNames.has(definition.name)) {
+          throw new RangeError(`导入文件中的动作名称重复: ${definition.name}`);
+        }
+        incomingNames.add(definition.name);
+        const existing = existingByName.get(definition.name);
+        if (existing) {
+          if (definitionContentSignature(existing) !== definitionContentSignature(definition)) {
+            throw new RangeError(`动作名称已存在但内容不同: ${definition.name}`);
+          }
+          skipped += 1;
+          continue;
+        }
+        pending.push(definition);
+      }
+
+      if (this.size + pending.length > MAX_ACTION_DEFINITIONS) {
+        throw new RangeError(`导入后最多可以保存 ${MAX_ACTION_DEFINITIONS} 个命名动作`);
+      }
+
+      // Build every new definition against a copied allocation context first.
+      // The live library is changed only after the complete batch succeeds.
+      const context = this._context();
+      const added = pending.map((definition) => canonicalDefinition({
+        name: definition.name,
+        motions: definition.motions.map((motion) => ({
+          motorId: motion.motorId,
+          nodeId: motion.nodeId,
+          startMs: motion.startMs,
+          signedSteps: motion.signedSteps,
+          speed: motion.speed,
+          acceleration: motion.acceleration,
+          closed: motion.closed,
+        })),
+      }, context, {
+        allowDefinitionId: () => false,
+        allowMotionId: () => false,
+      }));
+
+      if (added.length) {
+        this._definitions.push(...added);
+        for (const definition of added) this._definitionIds.add(definition.actionDefinitionId);
+        this._commitContext(context);
+        this._revision += 1;
+      }
+      return Object.freeze({
+        added: freezeArray(added),
+        skipped,
+      });
     }
   }
 
@@ -699,7 +878,13 @@
     MAX_ACTION_TRACK_NAME_LENGTH,
     MAX_START_MS,
     MAX_STEP_COUNT,
+    ACTION_PLAYBACK_RATES,
+    validateActionPlaybackSettings,
+    actionPlaybackStartMs,
+    actionPlaybackDurationMs,
+    motionForActionPlayback,
     validateMotion,
+    validateActionFileMotion,
     validateActionDefinition,
     deriveMotionLanes,
     validatePlacement,

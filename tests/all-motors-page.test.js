@@ -430,7 +430,41 @@ test("return-to-origin does not consult timeline track enable", () => {
   const confirmation = origin.indexOf("await confirmAction(");
   const begin = origin.indexOf('beginOperation("返回起点")');
   assert.ok(preflight >= 0 && confirmation > preflight && begin > confirmation);
+  assert.equal(
+    (origin.match(/await requireIdleNodes\(commands\)/g) || []).length,
+    2,
+    "origin return must verify fresh idle status before and after operator confirmation",
+  );
+  assert.match(origin, /state\.connectionEpoch === connectionEpoch/);
+  assert.match(origin, /state\.driverSessionEpoch === driverSessionEpoch/);
+  assert.match(origin, /state\.ledger\.createReturnCommands\(\)/);
+  assert.match(origin, /recordLedger:\s*false/,
+    "return commands must be accounted only through their explicit compensation results");
+  assert.match(origin, /state\.ledger\.markReturnResults\(commands, results\)/);
   assert.doesNotMatch(origin, /timelineTrackIsEnabled|timelineTrackEnabled|enabledTimelineActions/);
+});
+
+test("setting the current position as origin is session-bound and rechecks idle after confirmation", () => {
+  const setOrigin = functionSource("setCurrentAsOrigin");
+  assert.match(setOrigin, /const nodes = configuredNodeIds\(\)/);
+  assert.match(setOrigin, /if \(!nodes\.length\)/);
+  assert.match(setOrigin, /state\.originSetPreparing = true/);
+  assert.match(setOrigin, /state\.originReturnPreparing/);
+  assert.match(setOrigin, /state\.connectionEpoch === connectionEpoch/);
+  assert.match(setOrigin, /state\.driverSessionEpoch === driverSessionEpoch/);
+  assert.match(setOrigin, /nodeIdSignature\(\) === bindingSignature/);
+  assert.equal(
+    (setOrigin.match(/await requireIdleNodeIds\(nodes\)/g) || []).length,
+    2,
+    "manual origin must verify fresh idle status both before and after operator confirmation",
+  );
+  assert.match(setOrigin, /finally\s*\{[\s\S]*state\.originSetPreparing = false/);
+});
+
+test("every STOP, DISABLE, or emergency request invalidates origin continuity", () => {
+  for (const name of ["stopMotor", "disableMotor", "emergencyStop"]) {
+    assert.match(functionSource(name), /invalidateOrigin\(/, `${name} must invalidate the local origin`);
+  }
 });
 
 test("STOP, DISABLE, and emergency stop are never blocked by timeline track enable", () => {

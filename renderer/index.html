@@ -161,9 +161,10 @@
 
       <section class="panel timeline-panel">
         <header class="timeline-toolbar">
-          <div class="timeline-transport">
+          <div class="timeline-transport" role="group" aria-label="电机控制时间轴播放控制">
             <button id="timelinePlayButton" class="button primary" type="button" disabled>▶ 从头播放</button>
             <button id="timelineStopButton" class="button warning" type="button" disabled>■ 停止</button>
+            <button id="timelineReturnOriginButton" class="button secondary timeline-return-origin-button" type="button" disabled title="连接 CAN 后可恢复到本次连接起点">↶ 恢复起点</button>
           </div>
           <output id="timelineTimeDisplay" class="timeline-time-display">00:00.000 / 00:10.000</output>
           <div class="timeline-tools">
@@ -200,6 +201,11 @@
           </div>
           <button id="namedActionNewButton" class="button secondary compact" type="button">＋ 新动作</button>
         </header>
+
+        <div class="named-action-library-file-actions" role="group" aria-label="动作库文件操作">
+          <button id="namedActionImportLibraryButton" class="button secondary compact" type="button" title="从 JSON 文件追加导入已保存动作">导入动作库</button>
+          <button id="namedActionExportLibraryButton" class="button secondary compact" type="button" title="将全部已保存动作导出为 JSON 文件">导出动作库</button>
+        </div>
 
         <div class="named-action-definition-form">
           <label>动作名称
@@ -314,15 +320,16 @@
     <main id="actionTimelinePage" class="app-page action-sequence-page" role="tabpanel" aria-labelledby="actionTimelineTab" hidden>
       <section class="panel action-sequence-panel">
         <header class="action-sequence-toolbar">
-          <div class="action-sequence-transport">
+          <div class="action-sequence-transport" role="group" aria-label="动作时间轴播放控制">
             <button id="actionTimelinePlayButton" class="button primary" type="button" disabled>▶ 从头播放</button>
             <button id="actionTimelineStopButton" class="button warning" type="button" disabled>■ 停止</button>
+            <button id="actionTimelineReturnOriginButton" class="button secondary timeline-return-origin-button" type="button" disabled title="连接 CAN 后可恢复到本次连接起点">↶ 恢复起点</button>
           </div>
           <output id="actionTimelineTimeDisplay" class="timeline-time-display">00:00.000 / 00:10.000</output>
           <div class="action-sequence-project-actions" role="group" aria-label="动作时间轴文件操作">
             <button id="actionTimelineSaveProjectButton" class="button secondary compact" type="button">保存时间轴</button>
-            <button id="actionTimelineImportProjectButton" class="button secondary compact" type="button">导入动画</button>
-            <button id="actionTimelineExportProjectButton" class="button secondary compact" type="button">导出动画</button>
+            <button id="actionTimelineImportProjectButton" class="button secondary compact" type="button">导入时间轴</button>
+            <button id="actionTimelineExportProjectButton" class="button secondary compact" type="button">导出时间轴</button>
           </div>
           <button id="actionTimelineAddTrackButton" class="button secondary action-add-track-button" type="button">＋ 添加轨道</button>
           <div class="action-sequence-tools">
@@ -333,6 +340,37 @@
             <button id="actionTimelineClearButton" class="text-button" type="button" disabled>清空</button>
           </div>
         </header>
+
+        <div id="actionTimelinePlaybackOptions" class="action-playback-options" role="group" aria-label="动作时间轴播放调速">
+          <strong>播放调速</strong>
+          <label><span>模式</span>
+            <select id="actionTimelineRateModeSelect" aria-label="播放调速模式">
+              <option value="time" selected>时间倍速</option>
+              <option value="parameters">电机参数倍率</option>
+            </select>
+          </label>
+          <button id="actionTimelineSlowerButton" class="action-playback-step-button" type="button" aria-label="降低播放倍率">－ 慢放</button>
+          <label><span>倍率</span>
+            <select id="actionTimelineRateSelect" aria-label="播放倍率">
+              <option value="0.25">0.25× · 慢</option>
+              <option value="0.5">0.50× · 慢</option>
+              <option value="0.75">0.75× · 慢</option>
+              <option value="1" selected>1.00× · 原速</option>
+              <option value="1.25">1.25× · 快</option>
+              <option value="1.5">1.50× · 快</option>
+              <option value="2">2.00× · 快</option>
+            </select>
+          </label>
+          <button id="actionTimelineFasterButton" class="action-playback-step-button" type="button" aria-label="提高播放倍率">＋ 快放</button>
+          <label><span>调整参数</span>
+            <select id="actionTimelineRateTargetSelect" aria-label="电机参数倍率调整对象" disabled>
+              <option value="speed">速度等级</option>
+              <option value="acceleration">加速度等级</option>
+              <option value="both" selected>速度＋加速度</option>
+            </select>
+          </label>
+          <output id="actionTimelineRateHint" class="action-playback-hint" aria-live="polite">原速：动作时间和电机参数均不改变</output>
+        </div>
 
         <div class="action-sequence-workspace">
           <aside class="action-palette" aria-labelledby="actionPaletteTitle">

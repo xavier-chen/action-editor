@@ -59,7 +59,7 @@ test("action-timeline export is one self-contained versioned JSON document", () 
   assert.match(exported, /schemaVersion:\s*ACTION_TIMELINE_FILE_SCHEMA_VERSION/);
   assert.match(exported, /exportedAt:\s*new Date\(\)\.toISOString\(\)/);
   assert.match(exported, /namedActions:\s*\{[\s\S]*definitions:\s*library\.snapshot\(\)/);
-  assert.match(exported, /actionTimeline:\s*\{/);
+  assert.match(exported, /actionTimeline:\s*\{[\s\S]*schemaVersion:\s*2/);
   assert.match(exported, /tracks:\s*actionTracks\.snapshot\(\)/);
   assert.match(exported, /placements:\s*sequence\.snapshot\(\)/);
   for (const field of ["durationMs", "snapMs", "pixelsPerSecond"]) {
@@ -67,8 +67,40 @@ test("action-timeline export is one self-contained versioned JSON document", () 
   }
 
   const action = functionSource(controller, "exportActionTimelineProject");
+  assert.match(action, /draftIsDirty\(\)/);
+  assert.match(action, /请先保存动作再导出时间轴/);
   assert.match(action, /JSON\.stringify\(exportActionTimelineDocument\(\), null, 2\)/);
   assert.match(action, /api\.exportActionTimelineFile\(content\)/);
+});
+
+test("playback scaling remains runtime-only and does not change either saved schema", () => {
+  assert.match(controller, /const ACTION_TIMELINE_FILE_SCHEMA_VERSION\s*=\s*1/,
+    "the independent action-timeline file format remains schema 1");
+
+  const exported = functionSource(controller, "exportActionTimelineDocument");
+  assert.match(exported, /actionTimeline:\s*\{[\s\S]*schemaVersion:\s*2/,
+    "the nested authored timeline remains schema 2");
+  assert.doesNotMatch(
+    exported,
+    /\bactionTimelinePlaybackSettings\b|\bplaybackSettings\b|\bplaybackRate\b|\brate\s*:/,
+    "export must contain authored definitions and placements, not temporary playback controls",
+  );
+
+  const persisted = functionSource(controller, "persistedStateFields");
+  assert.match(persisted, /namedActions:\s*\{[\s\S]*schemaVersion:\s*1/);
+  assert.match(persisted, /actionTimeline:\s*\{[\s\S]*schemaVersion:\s*2/);
+  assert.doesNotMatch(
+    persisted,
+    /\bactionTimelinePlaybackSettings\b|\bplaybackSettings\b|\bplaybackRate\b|\brate\s*:/,
+    "local save must not make a playback audition setting part of the project",
+  );
+
+  const normalize = functionSource(controller, "normalizeImportedActionTimeline");
+  assert.doesNotMatch(
+    normalize,
+    /\bactionTimelinePlaybackSettings\b|\bplaybackSettings\b|\bplaybackRate\b|\brate\b/,
+    "schema-1/schema-2 imports stay strict and do not silently accept transient rate fields",
+  );
 });
 
 test("action-timeline import completely validates references and limits before constructing replacements", () => {
@@ -83,8 +115,11 @@ test("action-timeline import completely validates references and limits before c
   assert.match(normalize, /new actionModel\.ActionLibrary\(/);
   assert.match(normalize, /new actionModel\.ActionTrackCatalog\(/);
   assert.match(normalize, /new actionModel\.NamedActionTimeline\(/);
+  assert.match(normalize, /actionModel\.validateActionFileMotion\(motion\)/);
   assert.match(normalize, /actionDefinitionId/);
   assert.match(normalize, /trackId/);
+  assert.match(normalize, /configurationInteger\(placement\.startMs/);
+  assert.match(normalize, /currentMotor\.label !== importedLabel/);
   assert.match(normalize, /MAX_EXPANDED_MOTIONS/);
   assert.match(normalize, /actionModel\.MAX_START_MS/);
   assert.match(normalize, /hasMotor\(/,
@@ -181,8 +216,7 @@ test("action-timeline files use dedicated trusted IPC and bounded JSON-only dial
     assert.match(action, /assertJsonFilePath/);
     assert.match(action, /JSON/);
   }
-  assert.match(importFile, /fs\.stat/);
-  assert.match(importFile, /info\.isFile\(\)/);
+  assert.match(importFile, /readBoundedTextFile/);
   assert.match(main, /const MAX_ACTION_TIMELINE_FILE_BYTES\s*=\s*16\s*\*\s*1024\s*\*\s*1024/);
   assert.match(functionSource(main, "actionTimelineText"), /MAX_ACTION_TIMELINE_FILE_BYTES/);
   assert.match(importFile, /MAX_ACTION_TIMELINE_FILE_BYTES/);

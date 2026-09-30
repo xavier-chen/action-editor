@@ -7,6 +7,8 @@ const CONFIG_EXPORT_CHANNEL = "motor-terminal:config-export";
 const CONFIG_IMPORT_CHANNEL = "motor-terminal:config-import";
 const TIMELINE_EXPORT_CHANNEL = "motor-terminal:timeline-export";
 const TIMELINE_IMPORT_CHANNEL = "motor-terminal:timeline-import";
+const ACTION_LIBRARY_EXPORT_CHANNEL = "motor-terminal:action-library-export";
+const ACTION_LIBRARY_IMPORT_CHANNEL = "motor-terminal:action-library-import";
 const ACTION_TIMELINE_EXPORT_CHANNEL = "motor-terminal:action-timeline-export";
 const ACTION_TIMELINE_IMPORT_CHANNEL = "motor-terminal:action-timeline-import";
 const DRIVER_EVENT = "driver:event";
@@ -37,6 +39,8 @@ contextBridge.exposeInMainWorld("motorTerminal", Object.freeze({
   importConfigFile: () => ipcRenderer.invoke(CONFIG_IMPORT_CHANNEL),
   exportTimelineFile: (content) => ipcRenderer.invoke(TIMELINE_EXPORT_CHANNEL, content),
   importTimelineFile: () => ipcRenderer.invoke(TIMELINE_IMPORT_CHANNEL),
+  exportActionLibraryFile: (content) => ipcRenderer.invoke(ACTION_LIBRARY_EXPORT_CHANNEL, content),
+  importActionLibraryFile: () => ipcRenderer.invoke(ACTION_LIBRARY_IMPORT_CHANNEL),
   exportActionTimelineFile: (content) => ipcRenderer.invoke(ACTION_TIMELINE_EXPORT_CHANNEL, content),
   importActionTimelineFile: () => ipcRenderer.invoke(ACTION_TIMELINE_IMPORT_CHANNEL),
   onDriverEvent,

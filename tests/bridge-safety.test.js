@@ -422,7 +422,12 @@ test("Python bridge simulation exercises V2.6 status D and format 6 FIFO motion"
     nodeId: 17,
     simulate: true,
   });
-  assert.deepEqual(connected, { connected: true, nodeId: 17, simulate: true });
+  assert.deepEqual(connected, {
+    connected: true,
+    nodeId: 17,
+    simulate: true,
+    sessionEpoch: 1,
+  });
   const pingRequest = await bridge.requestWithAck("ping");
   assert.equal(pingRequest.ack.sequence, pingRequest.sequence);
   assert.equal(pingRequest.ack.commandClass, 3);
@@ -472,6 +477,11 @@ test("Python bridge simulation exercises V2.6 status D and format 6 FIFO motion"
     events.filter((event) => event.event === "status").map((event) => event.data.part),
     ["A", "B", "C", "D", "E", "D"],
   );
+  assert.ok(
+    events.filter((event) => event.event === "status")
+      .every((event) => event.data.sessionEpoch === connected.sessionEpoch),
+    "every status frame must retain the transport session that produced it",
+  );
   const limits = events.find((event) => (
     event.event === "status" && event.data.part === "E"
   ));
@@ -511,7 +521,10 @@ test("Python bridge simulation exercises V2.6 status D and format 6 FIFO motion"
   assert.equal(thirdMotion.sequence, 2);
   assert.equal(thirdMotion.ack.value, 3);
   assert.equal(motion.ack.sequence, motion.sequence);
+  assert.equal(motion.ack.nodeId, motion.nodeId);
   assert.equal(motion.ack.commandClass, 1);
+  assert.equal(motion.ack.opcode, 0);
+  assert.equal(motion.ack.ok, true);
   const motionFrame = events.find((event) => (
     event.event === "frame"
     && event.data.direction === "tx"

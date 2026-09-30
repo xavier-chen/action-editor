@@ -1930,13 +1930,19 @@ class MotorService:
                 "CAN 会话代号", requested_epoch, 0, 0x7FFFFFFF
             )
         self.disconnect({})
+        receive_callback = lambda item, epoch=session_epoch: \
+            self._receive_frame(item, epoch)
+        error_callback = lambda message, fatal=False, source=None, \
+            epoch=session_epoch: self._transport_error(
+                message, fatal, source, epoch
+            )
         if simulate:
             transport: Any = SimulatedTransport(
-                self._receive_frame, self._transport_error
+                receive_callback, error_callback
             )
         else:
             transport = SocketCanTransport(
-                self._receive_frame, self._transport_error
+                receive_callback, error_callback
             )
         transport.connect(interface, node)
         with self.lock:
@@ -1951,8 +1957,12 @@ class MotorService:
         emit("connection", {
             "connected": True, "interface": interface,
             "nodeId": node, "simulate": simulate,
+            "sessionEpoch": session_epoch,
         })
-        return {"connected": True, "nodeId": node, "simulate": simulate}
+        return {
+            "connected": True, "nodeId": node, "simulate": simulate,
+            "sessionEpoch": session_epoch,
+        }
 
     def disconnect(self, params: Dict[str, Any]) -> Dict[str, Any]:
         requested_epoch = params.get("sessionEpoch")
@@ -1974,9 +1984,13 @@ class MotorService:
         if session_epoch is not None:
             with self.lock:
                 self.session_epoch = session_epoch
+        event_epoch = self.session_epoch
         if was_connected:
-            emit("connection", {"connected": False})
-        return {"connected": False}
+            emit("connection", {
+                "connected": False,
+                "sessionEpoch": event_epoch,
+            })
+        return {"connected": False, "sessionEpoch": event_epoch}
 
     def set_node(self, params: Dict[str, Any]) -> Dict[str, Any]:
         node = bounded_int("节点 ID", params.get("nodeId"), 0, 127)
@@ -1989,8 +2003,9 @@ class MotorService:
         emit("connection", {
             "connected": True, "interface": self.interface,
             "nodeId": node, "simulate": self.simulate,
+            "sessionEpoch": self.session_epoch,
         })
-        return {"nodeId": node}
+        return {"nodeId": node, "sessionEpoch": self.session_epoch}
 
     def ping(self, params: Dict[str, Any]) -> Dict[str, Any]:
         return self._control(PING, params=params)
@@ -2329,14 +2344,23 @@ class MotorService:
         emit("frame", frame_json(item, "tx"))
         transport.send(item)
 
-    def _receive_frame(self, item: Dict[str, Any]) -> None:
-        emit("frame", frame_json(item, "rx"))
+    def _receive_frame(self, item: Dict[str, Any],
+                       session_epoch: Optional[int] = None) -> None:
+        event_epoch = self.session_epoch \
+            if session_epoch is None else session_epoch
+        frame_event = frame_json(item, "rx")
+        frame_event["sessionEpoch"] = event_epoch
+        emit("frame", frame_event)
         try:
             decoded = self._decode(item)
         except Exception as exc:
-            emit("error", {"message": "协议解码失败: {}".format(exc)})
+            emit("error", {
+                "message": "协议解码失败: {}".format(exc),
+                "sessionEpoch": event_epoch,
+            })
             return
         if decoded is not None:
+            decoded["data"]["sessionEpoch"] = event_epoch
             emit(decoded["event"], decoded["data"])
 
     def _decode(self, item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -2556,13 +2580,22 @@ class MotorService:
         return None
 
     def _transport_error(self, message: str, fatal: bool = False,
-                         source: Optional[Any] = None) -> None:
+                         source: Optional[Any] = None,
+                         session_epoch: Optional[int] = None) -> None:
+        event_epoch = self.session_epoch \
+            if session_epoch is None else session_epoch
         if not fatal:
-            emit("error", {"message": message})
+            emit("error", {
+                "message": message,
+                "sessionEpoch": event_epoch,
+            })
             return
         with self.lock:
             if source is not None and self.transport is not source:
-                emit("error", {"message": message})
+                emit("error", {
+                    "message": message,
+                    "sessionEpoch": event_epoch,
+                })
                 return
             transport = self.transport
             was_connected = self.connected
@@ -2573,11 +2606,15 @@ class MotorService:
             self.motion_replays.clear()
         if transport is not None:
             transport.close()
-        emit("error", {"message": message})
+        emit("error", {
+            "message": message,
+            "sessionEpoch": event_epoch,
+        })
         if was_connected:
             emit("connection", {
                 "connected": False,
                 "reason": "transport-error",
+                "sessionEpoch": event_epoch,
             })
 
     def _require_transport(self) -> Any:

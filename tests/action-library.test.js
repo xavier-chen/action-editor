@@ -15,10 +15,16 @@ const {
   MAX_PLACEMENTS,
   MAX_START_MS,
   MAX_STEP_COUNT,
+  ACTION_PLAYBACK_RATES,
   ActionLibrary,
   ActionTrackCatalog,
   NamedActionTimeline,
+  actionPlaybackDurationMs,
+  actionPlaybackStartMs,
   deriveMotionLanes,
+  motionForActionPlayback,
+  validateActionPlaybackSettings,
+  validateActionFileMotion,
   validateActionDefinition,
   validateActionTrack,
   validateMotion,
@@ -60,6 +66,164 @@ function actionTrack(overrides = {}) {
     ...overrides,
   };
 }
+
+test("action playback settings provide immutable defaults and accept every supported rate", () => {
+  assert.deepEqual(ACTION_PLAYBACK_RATES, [0.25, 0.5, 0.75, 1, 1.25, 1.5, 2]);
+  assert.ok(Object.isFrozen(ACTION_PLAYBACK_RATES));
+  assert.deepEqual(validateActionPlaybackSettings(), {
+    mode: "time",
+    rate: 1,
+    parameterTarget: "both",
+  });
+  assert.ok(Object.isFrozen(validateActionPlaybackSettings({})));
+
+  for (const rate of ACTION_PLAYBACK_RATES) {
+    assert.equal(validateActionPlaybackSettings({ rate }).rate, rate);
+  }
+  assert.deepEqual(validateActionPlaybackSettings({
+    mode: "parameters",
+    rate: "1.25",
+    parameterTarget: "speed",
+  }), {
+    mode: "parameters",
+    rate: 1.25,
+    parameterTarget: "speed",
+  });
+});
+
+test("action playback settings reject unknown fields, modes, targets, and rates", () => {
+  assert.throws(() => validateActionPlaybackSettings(null), /必须是对象/);
+  assert.throws(() => validateActionPlaybackSettings({ extra: true }), /未知字段/);
+  assert.throws(() => validateActionPlaybackSettings({ mode: "motor" }), /播放模式/);
+  assert.throws(
+    () => validateActionPlaybackSettings({ parameterTarget: "steps" }),
+    /参数目标/,
+  );
+  for (const rate of [null, "", false, 0, 0.1, 3, NaN, Infinity]) {
+    assert.throws(() => validateActionPlaybackSettings({ rate }), /播放倍率/);
+  }
+});
+
+test("time playback scales start times by rounding and durations by ceiling", () => {
+  const expectedByRate = [
+    [0.25, 404, 404],
+    [0.5, 202, 202],
+    [0.75, 135, 135],
+    [1, 101, 101],
+    [1.25, 81, 81],
+    [1.5, 67, 68],
+    [2, 51, 51],
+  ];
+  for (const [rate, expectedStartMs, expectedDurationMs] of expectedByRate) {
+    assert.equal(actionPlaybackStartMs(101, { mode: "time", rate }), expectedStartMs);
+    assert.equal(actionPlaybackDurationMs(101, { mode: "time", rate }), expectedDurationMs);
+  }
+  assert.equal(actionPlaybackDurationMs(1, { mode: "time", rate: 2 }), 1);
+
+  assert.equal(actionPlaybackStartMs(101, { mode: "parameters", rate: 2 }), 101);
+  assert.equal(actionPlaybackDurationMs(101, { mode: "parameters", rate: 2 }), 101);
+  assert.equal(actionPlaybackStartMs(MAX_START_MS, { rate: 0.25 }), MAX_START_MS * 4);
+  assert.equal(actionPlaybackDurationMs(MAX_START_MS, { rate: 0.25 }), MAX_START_MS * 4);
+});
+
+test("action playback time helpers validate their source ranges", () => {
+  for (const startMs of [-1, 1.5, MAX_START_MS + 1, null, ""]) {
+    assert.throws(() => actionPlaybackStartMs(startMs), /开始时间/);
+  }
+  for (const durationMs of [0, -1, 1.5, MAX_START_MS + 1, null, ""]) {
+    assert.throws(() => actionPlaybackDurationMs(durationMs), /动作时长/);
+  }
+});
+
+test("parameter playback independently scales speed, acceleration, or both", () => {
+  const source = motion({
+    motionId: "source-motion",
+    speed: 31,
+    acceleration: 21,
+    closed: true,
+  });
+  const speedOnly = motionForActionPlayback(source, {
+    mode: "parameters",
+    rate: 1.5,
+    parameterTarget: "speed",
+  });
+  const accelerationOnly = motionForActionPlayback(source, {
+    mode: "parameters",
+    rate: 1.5,
+    parameterTarget: "acceleration",
+  });
+  const both = motionForActionPlayback(source, {
+    mode: "parameters",
+    rate: 1.5,
+    parameterTarget: "both",
+  });
+
+  assert.deepEqual(speedOnly, { ...source, speed: 47 });
+  assert.deepEqual(accelerationOnly, { ...source, acceleration: 32 });
+  assert.deepEqual(both, { ...source, speed: 47, acceleration: 32 });
+  assert.ok(Object.isFrozen(speedOnly));
+  assert.ok(Object.isFrozen(accelerationOnly));
+  assert.ok(Object.isFrozen(both));
+  assert.deepEqual(source, motion({
+    motionId: "source-motion",
+    speed: 31,
+    acceleration: 21,
+    closed: true,
+  }));
+
+  const expectedLevels = [10, 20, 30, 40, 50, 60, 80];
+  ACTION_PLAYBACK_RATES.forEach((rate, index) => {
+    const effective = motionForActionPlayback(motion({ speed: 40, acceleration: 40 }), {
+      mode: "parameters",
+      rate,
+    });
+    assert.equal(effective.speed, expectedLevels[index]);
+    assert.equal(effective.acceleration, expectedLevels[index]);
+  });
+});
+
+test("parameter playback clamps levels while time playback leaves motion parameters unchanged", () => {
+  const high = motionForActionPlayback(motion({ speed: 80, acceleration: 100 }), {
+    mode: "parameters",
+    rate: 2,
+  });
+  const low = motionForActionPlayback(motion({ speed: 1, acceleration: 2 }), {
+    mode: "parameters",
+    rate: 0.25,
+  });
+  const timeScaled = motionForActionPlayback(motion({ speed: 31, acceleration: 21 }), {
+    mode: "time",
+    rate: 2,
+    parameterTarget: "speed",
+  });
+
+  assert.equal(high.speed, 100);
+  assert.equal(high.acceleration, 100);
+  assert.equal(low.speed, 1);
+  assert.equal(low.acceleration, 1);
+  assert.equal(timeScaled.speed, 31);
+  assert.equal(timeScaled.acceleration, 21);
+  assert.ok(Object.isFrozen(timeScaled));
+});
+
+test("temporary playback motions never alter action-library snapshots", () => {
+  const library = new ActionLibrary([definition({
+    actionDefinitionId: "saved-action",
+    motions: [motion({ motionId: "saved-motion", speed: 80, acceleration: 60 })],
+  })]);
+  const before = library.snapshot();
+  const effective = motionForActionPlayback(before[0].motions[0], {
+    mode: "parameters",
+    rate: 2,
+    parameterTarget: "both",
+  });
+
+  assert.notEqual(effective, before[0].motions[0]);
+  assert.equal(effective.speed, 100);
+  assert.equal(effective.acceleration, 100);
+  assert.deepEqual(library.snapshot(), before);
+  assert.equal(library.revision, 1);
+});
 
 test("motions normalize form values, freeze output, and default legacy mode to open loop", () => {
   const legacy = motion({
@@ -103,6 +267,24 @@ test("motion validation enforces all protocol ranges and rejects unknown fields"
   }
   assert.throws(() => validateMotion(motion({ motorId: "Bad Motor" })), /内部 ID/);
   assert.throws(() => validateMotion({ ...motion(), extra: true }), /未知字段/);
+});
+
+test("action-file motions require native JSON integers and an explicit loop mode", () => {
+  assert.deepEqual(validateActionFileMotion(motion()), validateMotion(motion()));
+  for (const field of ["nodeId", "startMs", "signedSteps", "speed", "acceleration"]) {
+    assert.throws(
+      () => validateActionFileMotion(motion({ [field]: String(motion()[field]) })),
+      /JSON 整数/,
+    );
+    assert.throws(
+      () => validateActionFileMotion(motion({ [field]: [motion()[field]] })),
+      /JSON 整数/,
+    );
+  }
+  assert.throws(() => validateActionFileMotion({ ...motion(), closed: "false" }), /布尔值/);
+  const withoutMode = motion();
+  delete withoutMode.closed;
+  assert.throws(() => validateActionFileMotion(withoutMode), /布尔值/);
 });
 
 test("named definitions enforce Unicode names, motion counts, and immutable nested arrays", () => {
@@ -285,6 +467,75 @@ test("library import replaces active data without permitting retired ID reuse", 
   assert.throws(() => library.import([retired]), /已使用/);
   assert.equal(library.size, 0);
   assert.equal(library.add(definition({ name: "新动作" })).actionDefinitionId, "action-definition-000002");
+});
+
+test("action-library append imports are atomic, additive, and allocate fresh local IDs", () => {
+  const library = new ActionLibrary();
+  const existing = library.add(definition({
+    actionDefinitionId: "source-action",
+    name: "眨眼",
+    motions: [motion({ motionId: "source-motion" })],
+  }));
+  const retired = library.add(definition({ name: "已删除" }));
+  library.remove(retired.actionDefinitionId);
+  const revisionBefore = library.revision;
+
+  const result = library.appendAsNew([
+    definition({
+      actionDefinitionId: existing.actionDefinitionId,
+      name: "微笑",
+      motions: [motion({ motionId: existing.motions[0].motionId, motorId: "neck", nodeId: 12 })],
+    }),
+  ]);
+
+  assert.equal(result.added.length, 1);
+  assert.equal(result.skipped, 0);
+  assert.equal(library.size, 2);
+  assert.equal(library.revision, revisionBefore + 1);
+  assert.equal(library.snapshot()[0], existing, "existing definitions and IDs must remain untouched");
+  assert.notEqual(result.added[0].actionDefinitionId, existing.actionDefinitionId);
+  assert.notEqual(result.added[0].actionDefinitionId, retired.actionDefinitionId);
+  assert.notEqual(result.added[0].motions[0].motionId, existing.motions[0].motionId);
+  assert.ok(Object.isFrozen(result));
+  assert.ok(Object.isFrozen(result.added));
+});
+
+test("action-library append skips exact repeats and rejects conflicting names without partial changes", () => {
+  const library = new ActionLibrary([
+    definition({
+      actionDefinitionId: "saved-blink",
+      name: "眨眼",
+      motions: [motion({ motionId: "saved-blink-motion" })],
+    }),
+  ]);
+  const before = library.snapshot();
+  const revisionBefore = library.revision;
+  const repeated = library.appendAsNew([
+    definition({
+      actionDefinitionId: "foreign-blink",
+      name: "眨眼",
+      motions: [motion({ motionId: "foreign-blink-motion" })],
+    }),
+  ]);
+  assert.equal(repeated.added.length, 0);
+  assert.equal(repeated.skipped, 1);
+  assert.deepEqual(library.snapshot(), before);
+  assert.equal(library.revision, revisionBefore);
+
+  assert.throws(() => library.appendAsNew([
+    definition({
+      actionDefinitionId: "foreign-smile",
+      name: "微笑",
+      motions: [motion({ motionId: "foreign-smile-motion", motorId: "neck", nodeId: 12 })],
+    }),
+    definition({
+      actionDefinitionId: "changed-blink",
+      name: "眨眼",
+      motions: [motion({ motionId: "changed-blink-motion", signedSteps: -200 })],
+    }),
+  ]), /名称已存在但内容不同/);
+  assert.deepEqual(library.snapshot(), before, "a later conflict must roll back the complete append batch");
+  assert.equal(library.revision, revisionBefore);
 });
 
 test("named action library is capped at 128 definitions", () => {
@@ -483,5 +734,9 @@ test("UMD build exposes action library, placement timeline, and track catalog mo
   assert.equal(typeof context.FaceActionLibrary.NamedActionTimeline, "function");
   assert.equal(typeof context.FaceActionLibrary.ActionTrackCatalog, "function");
   assert.equal(typeof context.FaceActionLibrary.deriveMotionLanes, "function");
+  assert.equal(typeof context.FaceActionLibrary.validateActionPlaybackSettings, "function");
+  assert.equal(typeof context.FaceActionLibrary.actionPlaybackStartMs, "function");
+  assert.equal(typeof context.FaceActionLibrary.actionPlaybackDurationMs, "function");
+  assert.equal(typeof context.FaceActionLibrary.motionForActionPlayback, "function");
   assert.ok(Object.isFrozen(context.FaceActionLibrary));
 });

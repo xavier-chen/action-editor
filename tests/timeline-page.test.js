@@ -120,6 +120,7 @@ test("timeline surface provides playback, stop, clear, ruler, lanes, and playhea
   for (const id of [
     "timelinePlayButton",
     "timelineStopButton",
+    "timelineReturnOriginButton",
     "timelineClearButton",
     "timelineRuler",
     "timelineTracks",
@@ -133,6 +134,18 @@ test("timeline surface provides playback, stop, clear, ruler, lanes, and playhea
   assert.match(styles, /\.timeline-ruler\s*\{[^}]*position:\s*sticky[^}]*touch-action:\s*none/);
   assert.match(styles, /\.timeline-ruler\.dragging\s*\{/);
   assert.match(styles, /\.timeline-playhead-handle\s*\{[^}]*pointer-events:\s*auto[^}]*touch-action:\s*none/);
+});
+
+test("motor-control timeline exposes the shared connection-origin recovery action", () => {
+  const pageStart = html.indexOf('<main id="timelineEditorPage"');
+  const pageEnd = html.indexOf('<main id="namedActionEditorPage"', pageStart);
+  assert.ok(pageStart >= 0 && pageEnd > pageStart);
+  const page = html.slice(pageStart, pageEnd);
+  assert.match(
+    page,
+    /id="timelineReturnOriginButton"[^>]*class="[^"]*timeline-return-origin-button[^"]*"[^>]*disabled[^>]*>\s*↶\s*恢复起点\s*</,
+  );
+  assert.match(page, /timelineReturnOriginButton[^>]*title="[^"]*本次连接起点[^"]*"/);
 });
 
 test("pressing and dragging the timeline ruler continuously captures and releases one pointer", () => {
@@ -509,6 +522,11 @@ test("idle and drain checks require a new ordered Status A and D pair", () => {
   assert.match(idle, /statusDAt >= statusAAt/);
   assert.match(idle, /expectedSequence/);
   assert.match(idle, /lastMotionSequence/);
+  assert.match(idle, /runtime\.moving === false/);
+  assert.match(idle, /queueOutstanding\) === 0/);
+  assert.match(idle, /queueActive !== true/);
+  assert.match(idle, /handoffPending !== true/);
+  assert.match(idle, /relativeRemaining\) === 0/);
   assert.match(idle, /!hasFault/);
   assert.match(transmit, /lastStatusAAt = 0/);
   assert.match(transmit, /lastStatusDAt = 0/);
@@ -535,13 +553,75 @@ test("timeline stop continuations cannot cross into another CAN connection", () 
 
 test("motion is logged to the origin ledger only after its matching hardware ACK", () => {
   const transmit = functionSource("transmit");
+  const maySend = transmit.indexOf("motionMayHaveBeenSent = true");
   const sent = transmit.indexOf("await api.move(payload)");
-  const waited = transmit.indexOf("await waitForMotionAck(command.nodeId, result.sequence)");
-  const accepted = transmit.indexOf("if (!ack.ok)");
+  const embeddedAck = transmit.indexOf("const ack = result?.ack", sent);
+  const accepted = transmit.indexOf("ack?.ok !== true", embeddedAck);
   const recorded = transmit.indexOf("state.ledger.recordSuccess(command)");
-  assert.ok(sent >= 0 && waited > sent && accepted > waited && recorded > accepted);
-  assert.match(app, /const MOTION_ACK_TIMEOUT_MS = 1_000/);
-  assert.match(functionSource("handleDriverEvent"), /receiveMotionAck\(data\)/);
+  const uncertain = transmit.indexOf("if (\n      motionMayHaveBeenSent", recorded);
+  assert.ok(maySend >= 0 && sent > maySend && embeddedAck > sent && accepted > embeddedAck && recorded > accepted);
+  assert.ok(uncertain > recorded,
+    "once bridge transmission is attempted, an unresolved result must invalidate the origin conservatively");
+  assert.match(transmit, /transmitConnectionEpoch === state\.connectionEpoch/);
+  assert.match(transmit, /Number\(ack\.nodeId\) !== command\.nodeId/);
+  assert.match(transmit, /Number\(ack\.commandClass\) !== expectedCommandClass/);
+  assert.match(transmit, /Number\(ack\.sequence\) !== result\.sequence/);
+  assert.doesNotMatch(
+    transmit,
+    /state\.ledger\.recordSuccess\(\s*command\s*,\s*ack(?:\.value)?\s*\)/,
+    "motion ACK value is FIFO depth, not an actual step count",
+  );
+  assert.doesNotMatch(app, /motionAckWaiters|motionAckCache|waitForMotionAck/,
+    "the renderer must consume the main process's already session-matched ACK instead of maintaining a second waiter");
+});
+
+test("a CAN connection establishes its origin only after every configured node is freshly idle", () => {
+  const connect = functionSource("connectCan");
+  const connected = connect.indexOf("state.connected = true");
+  const unreliable = connect.indexOf("state.originReliable = false", connected);
+  const nodes = connect.indexOf("const originNodes = configuredNodeIds()", unreliable);
+  const preflight = connect.indexOf("await requireIdleNodeIds(originNodes)", nodes);
+  const localSessionGuard = connect.indexOf("state.connectionEpoch === connectionEpoch", preflight);
+  const driverSessionGuard = connect.indexOf("state.driverSessionEpoch === connection.sessionEpoch", localSessionGuard);
+  const bindingGuard = connect.indexOf("nodeIdSignature() === originNodeSignature", driverSessionGuard);
+  const reliable = connect.indexOf("state.originReliable = true", bindingGuard);
+  assert.ok(connected >= 0 && unreliable > connected && nodes > unreliable && preflight > nodes);
+  assert.ok(localSessionGuard > preflight && driverSessionGuard > localSessionGuard);
+  assert.ok(bindingGuard > driverSessionGuard && reliable > bindingGuard,
+    "only the same live session and unchanged physical-node set may establish the connection origin");
+  assert.match(connect, /const originOperationEpoch = state\.operationEpoch/);
+  assert.match(connect, /state\.operationEpoch === originOperationEpoch/,
+    "STOP, DISABLE, or emergency activity during the probe must cancel automatic origin establishment");
+  assert.match(connect, /originNodes\.length > 0 && await requireIdleNodeIds/,
+    "an empty motor-ID set must never become a physical origin");
+  assert.match(connect, /连接起点未自动建立/);
+});
+
+test("driver status and ACK events cannot cross CAN session boundaries", () => {
+  const current = functionSource("driverEventIsCurrent");
+  assert.match(current, /state\.connected/);
+  assert.match(current, /Number\.isInteger\(state\.driverSessionEpoch\)/);
+  assert.match(current, /Number\(data\?\.sessionEpoch\) === state\.driverSessionEpoch/);
+  const events = functionSource("handleDriverEvent");
+  assert.match(events, /\(event === "ack" \|\| event === "status"\) && !driverEventIsCurrent\(data\)/);
+  const poll = functionSource("pollStatuses");
+  assert.match(poll, /const pollToken = Object\.freeze/);
+  assert.match(poll, /state\.connectionEpoch !== pollToken\.connectionEpoch/);
+  assert.match(poll, /state\.driverSessionEpoch !== pollToken\.driverSessionEpoch/);
+  assert.match(poll, /state\.statusPolling === pollToken/);
+});
+
+test("motor and named-action timelines use the same ACK-backed origin ledger", () => {
+  const dispatch = functionSource("dispatchTimelineGroup");
+  assert.match(dispatch, /transmit\(command,\s*timelineRunSource\(run\)/);
+  assert.doesNotMatch(
+    dispatch,
+    /recordLedger\s*:\s*false/,
+    "normal playback on either timeline surface must retain origin accounting",
+  );
+  const transmit = functionSource("transmit");
+  assert.match(transmit, /recordLedger\s*=\s*true/);
+  assert.match(transmit, /if\s*\(recordLedger\s*&&\s*!interrupted\)[\s\S]*state\.ledger\.recordSuccess\(command\)/);
 });
 
 test("stopping a timeline cancels future scheduling then stops every involved node", () => {
